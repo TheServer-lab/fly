@@ -1,318 +1,2139 @@
-# fly-cc
+# Fly
 
-A native compiler for [Fly 0.1](../fly-architecture.md) — lexer → parser →
-Sema → LLVM IR → object file → linked native binary.
+**The programming language for people who want Python's simplicity without Python's ecosystem sprawl.**
 
-**Status: milestones 1–6 of the roadmap in `docs/architecture.md` §7.**
-Working: `num`/`dec`/`yn`/`emp` scalars, `tex` (a real heap type, incl.
-string interpolation, §10), `coll`/`board` literals + indexing/slicing
-(§11-14) and the §15 ops (`attach`/`place`/`erase`/`count`/`seek`/`has`/
-`bind`/`sever`/`cut`/`raise`/`lower`, plus `take`), arithmetic (with
-checked `num` overflow), comparisons (content-equality for `tex`),
-`and`/`or`/`not`, `if`/`orif`/`ifnot`, `while`, `job`/`give`, `show`,
-`hard`, ARC (retain/release) memory management for `tex`/`coll`/`board`,
-`do`/`grabe` (§3.5, milestone 5) via real LLVM `invoke`/`landingpad` +
-the Itanium C++ exception ABI, and now (milestone 6) `num()`/`dec()`/
-`tex()` casts (§23), `for x in <iterable>` against the internal
-FlyIterator protocol (§3.4), and `bring`/project-local modules (§3.6).
-`examples/fizzbuzz.fly`, `examples/mixed_arith.fly`,
-`examples/interpolation.fly`, `examples/collections.fly`,
-`examples/arc_stress.fly`, `examples/error_handling.fly`,
-`examples/casting.fly`, `examples/for_loops.fly`, and
-`examples/modules_demo/` all compile and run correctly.
-`examples/arc_stress.fly` and `examples/for_loops.fly` (per their headers)
-run leak-free under `valgrind --leak-check=full`; `examples/error_handling.fly`
-and `examples/casting.fly` run crash/corruption-free under valgrind too,
-with the small, DOCUMENTED ARC-on-unwind leaks noted below (not silently
-swept under the rug).
+Fly is a high-level, dynamically typed, general-purpose programming language designed for **native compilation**, practical software development, and a complete first-party developer toolchain.
 
-**Not yet implemented** (later roadmap milestones, see
-`docs/architecture.md` for the design): concurrency (`task`/mutation-guard/
-channels — architecture.md §9, syntax still TBD anyway); within milestone
-6's own scope, `bring`'s bundled-standard-library and `flylink.sleep`
-dump-package resolution (§3.6 points 2–3) are also open items (already
-flagged as such by §21) — only project-local module resolution (§3.6
-point 1) is implemented, with an `FLY_STDLIB_DIR` environment variable as
-a documented stand-in for a real bundled stdlib.
+Write readable code. Compile it to a native executable. Manage dependencies. Build projects. Run tests. Format code. Package software. Update the toolchain.
 
-## ✅ Build-verified
+**One language. One toolchain. One ecosystem.**
 
-This tree now builds and runs end-to-end against LLVM 20 (Ubuntu 24.04,
-`llvm-20-dev`/`clang-20`; LLVM 17/18 are also expected to work per the
-version note below — milestone 5 was in fact built and verified against
-LLVM 18). Issues found and fixed while getting milestone 4
-running:
+---
 
-1. **`llvm/Support/Host.h` moved to `llvm/TargetParser/Host.h`** in LLVM
-   18 (`src/driver/driver.cpp`) — exactly the kind of shallow
-   API-version drift flagged in the original draft.
-2. **Real bug, not just a build error:** mixed `num`/`dec` arithmetic
-   (`3.14 * 2`, `a + b` where one side is `num`) silently produced
-   garbage. `runtime/arith.c` was reusing `fly_rt_as_dec()`, which
-   bit-reinterprets a `FlyValue`'s `i64` payload as a `double` — correct
-   for an actual `dec` value (whose payload *is* a bit-cast double), but
-   wrong for a `num` operand (whose payload is a raw integer). Bit-casting
-   the integer `2` as a double gives a tiny denormal, not `2.0`. Fixed by
-   adding a `toDec()` helper that properly *converts* (rounds) a `num`
-   payload to `double` instead of reinterpreting its bits, used
-   consistently across `+ - * / <`. Regression test:
-   `examples/mixed_arith.fly` / `tests/e2e/mixed_arith.expected`
-   (`mixed_arith_e2e` in ctest).
-3. **Real bug found while building milestone 4:** `tex` equality (`==`/
-   `!=`) compared raw payload bits, which meant two `tex` values with
-   identical *content* but produced by different allocations (e.g. two
-   separately-interpolated strings) compared unequal. Fixed in
-   `runtime/arith.c`'s `valuesEqual()` to do byte-content comparison for
-   `FLY_TEX` instead of pointer/payload equality; `coll`/`board` keep
-   identity comparison since the spec doesn't define deep equality for
-   them.
-4. **Real bug found while building milestone 4:** `genIndex()` in
-   `codegen.cpp` released the indexed *container* temp after a `[...]`
-   access but not the *index* temp itself. This was invisible for
-   `coll`/`tex` indexing (the index is always a scalar `num`, and
-   retain/release are no-ops on scalars) but leaked one `FlyText`
-   allocation per `board[key]` read with a `tex` key — caught by running
-   `examples/collections.fly` under `valgrind --leak-check=full` (2
-   blocks definitely lost, tracked straight back to the two `people[...]`
-   reads in that example). Fixed by releasing `idx`/`from`/`to` the same
-   way every other builtin-call argument is released.
+## Why Fly?
 
-## Milestone 4 design notes
+Programming languages often make you choose.
 
-- **`tex` is now a real heap object** (`runtime/text.c`'s `FlyText`:
-  refcounted header + length + owned, NUL-terminated buffer), not the
-  milestone-3 shortcut of bit-casting a `CreateGlobalStringPtr` straight
-  into the payload. Every text literal now allocates via
-  `fly_rt_text_from_cstr` at the point it's evaluated — no interning yet
-  (`docs/architecture.md` §2.2 flags that as a future optimization).
-- **String interpolation** (§10) lowers to the `fly_rt_strbuild_*` call
-  sequence from `docs/architecture.md` §3.4: `new` → one
-  `append_lit`/`append_value` per template segment, in source order →
-  `finish`. The lexer does the hard part (finding each `{expr}` span's
-  matching `}` via a bracket-kind stack, skipping over nested string
-  literals, honoring `{{`/`}}` escapes) and hands the parser raw,
-  unparsed expression source; the parser re-lexes/re-parses each span
-  with its own sub-`Lexer`+`Parser` instance.
-- **`coll`/`board`** are growable-array / parallel-key-value-array heap
-  objects (`runtime/coll.c`, `runtime/board.c`); `board` is linear-scan
-  only for now (§2.2's hash-table upgrade above a size threshold is a
-  documented, not-yet-built optimization). `board`'s "access syntax" is
-  explicitly left open by the spec (§12) — this implementation's choice:
-  `board[key]` reads (via `fly_rt_index`, returning `EMP` if absent) and
-  `place(board, key, val)` writes/upserts (reusing `place`'s vocabulary
-  rather than adding a new op name, matching how `count`/`has`/`erase`
-  already dispatch by container type at the runtime level).
-- **ARC** (§2.3): `codegen.cpp`'s top-of-file comment documents the exact
-  ownership convention used (every `genExpr()` result is a "+1 owned"
-  temporary; scope-exit and reassignment release accordingly). Refcounts
-  are plain `uint32_t`, not atomic — correct for now since nothing in this
-  milestone can share a `FlyValue` across threads/tasks (no concurrency
-  yet); swapping to atomic ops is a follow-up, not a layout change.
-  Verified leak-free and error-free under `valgrind --leak-check=full`
-  across every example, including `examples/arc_stress.fly`'s 2000
-  iterations × 20-element interpolated-`tex` colls (300,003 allocs,
-  300,003 frees, zero errors).
+You can have a friendly language, but then end up juggling a compiler, package manager, build system, environment manager, formatter, test runner, dependency files, and third-party tools.
 
-## Milestone 5 design notes (`do`/`grabe`)
+Or you can use a powerful systems language and spend more time fighting the language than building your software.
 
-- **Real `invoke`/`landingpad`, not a simulation.** `codegen.cpp`'s
-  `genDoGrabe` pushes the enclosing `grabe`'s landing pad onto a small
-  stack (`invokeStack_`) while generating a `do` block's statements; every
-  runtime/`job` call that can throw goes through a new `emitCall()` helper
-  that checks this stack and emits an `invoke` (instead of a plain `call`)
-  whenever it's non-empty. This falls out correctly for `do` blocks
-  containing nested `if`/`while`/blocks/nested `do`/`grabe` for free,
-  since it's threaded through the same recursive `genStmt`/`genExpr` walk
-  `scopes_` already uses.
-- **Built on the existing Itanium C++ exception ABI** (`runtime/eh.cpp`)
-  rather than a hand-rolled personality routine + LSDA parser: `fly_rt_throw`/
-  `fly_rt_throw_value` call libstdc++'s `__cxa_throw`, and codegen's
-  landing pads call `fly_rt_begin_catch`/`fly_rt_catch_extract`/
-  `fly_rt_end_catch`, which wrap `__cxa_begin_catch`/`__cxa_end_catch`.
-  The personality function attached to every generated function is
-  `__gxx_personality_v0` itself — libunwind does the actual stack walking,
-  exactly matching architecture.md §3.5's "LLVM exception machinery with
-  invoke/landingpad and libunwind."
-- **Catch-all only.** Every landing pad uses a single `catch i8* null`
-  clause (the standard Itanium-ABI idiom for `catch (...)`) since Fly 0.1
-  doesn't define multiple typed error kinds to discriminate between yet.
-  A minimal `FlyError` RTTI object exists in `eh.cpp` purely because
-  `__cxa_throw`'s signature requires a non-null `std::type_info*`; codegen
-  never looks at it.
-- **Implicit top-level catch-all.** The whole top-level statement sequence
-  (what becomes `main`'s body) is wrapped in its own invoke/landingpad
-  targeting `fly_rt_report_uncaught`, so an error that unwinds past every
-  user `grabe` still prints `fly: runtime error: <message>` and exits 1 —
-  matching §3.5's unhandled-error behavior exactly, just reached via real
-  unwinding now instead of the old MVP's immediate `exit()` at the throw
-  site.
-- **`-lstdc++` needed at link time** (`driver.cpp`): `fly-cc` still shells
-  out to `cc` (a C compiler driver) to link the final binary, which
-  doesn't pull in libstdc++ automatically the way `c++`/`clang++` would —
-  needed for the ABI symbols above.
-- **Every generated function now carries `uwtable` (async)** (`declareJob`/
-  `run()`'s `mainFn`): a `job` can be called from inside a `do` block and
-  itself throw several frames down through its OWN plain (non-invoke)
-  calls before that — unwind tables (.eh_frame CFI) are what let the
-  ABI's unwinder walk back through those intermediate frames correctly,
-  independent of whether that specific function ever emits an `invoke`
-  itself.
-- **Documented, NOT silently glossed-over limitation: no ARC
-  cleanup-on-unwind.** If an exception unwinds through a scope holding
-  live `tex`/`coll`/`board` locals (the `do` block's own locals, or a
-  called `job`'s locals), those references currently leak instead of
-  being released — verified via `examples/error_handling.fly` under
-  `valgrind`: zero invalid-memory errors/crashes, only small, expected
-  leaks matching exactly this gap. Full correctness here needs a cleanup
-  landingpad at every scope with heap-owning locals (essentially what a
-  C++ compiler builds for automatic local destructors) — real, separate
-  follow-up work, not implemented in this milestone. What IS real:
-  errors are genuinely thrown/caught via `invoke`/`landingpad`, `grabe`
-  genuinely runs with the right bound value, and a `do` block with no
-  error has completely ordinary ARC behavior.
+Fly is designed around a different idea:
 
-## Milestone 6 design notes (casting, `for`/iterators, `bring`/modules)
+> **The language and the toolchain should feel like one product.**
 
-- **Casts** (§23): `tex(v)` is not a new runtime entry point — it reuses
-  `fly_rt_to_text` (`runtime/text.c`), which already *is* the §10.3
-  "convert any `FlyValue` to its textual representation" conversion.
-  `num()`/`dec()` get their own `runtime/cast.c`, accepting every scalar
-  tag plus `tex` (parsed via `strtoll`/`strtod`, surrounding whitespace
-  tolerated, interior junk rejected) and throwing an ordinary Fly error
-  (catchable via `do`/`grabe`) on `EMP`/`coll`/`board` or an unparsable/
-  out-of-range/NaN source. `dec`→`num` truncates toward zero, matching
-  C's `(int64_t)` cast semantics, with explicit range-checking rather than
-  relying on double-to-`int64` overflow being undefined behavior.
-- **Iterators** (§3.4's "FlyIterator protocol", `runtime/iter.c`): the
-  iterator is an opaque native handle (`void*`), never a `FlyValue` — Fly
-  0.1 doesn't expose iterators as a first-class value. `for x in c { ... }`
-  lowers to `fly_rt_iter_new`/`_has_next`/`_next`/`_free` around a
-  `while`-shaped loop (`codegen.cpp`'s `genFor`), with `x` rebound fresh
-  each iteration exactly like `grabe`'s error variable. Scope, documented
-  rather than silently assumed: `coll` iterates elements in order, `board`
-  iterates **keys** in insertion order (the natural `for k in board { ...
-  board[k] ... }` idiom, given §12 itself leaves board's access syntax
-  open), `tex` iterates one-byte substrings (UTF-8 codepoint-aware
-  iteration is a documented future refinement); the container's length is
-  snapshotted at iterator-creation time, so mutating a `coll`/`board`
-  mid-loop is a documented MVP hazard, not a checked error. An early
-  `give` from inside a `for` body correctly frees every iterator it's
-  escaping through (`codegen.cpp`'s `iterStack_`, drained by
-  `releaseAllScopes()`) — verified leak-free under `valgrind
-  --leak-check=full` (see `examples/for_loops.fly`'s early-return case).
-- **`bring`/modules** (§3.6): resolved and merged entirely in
-  `driver.cpp` (see its `ModuleMerger` class comment) **before** Sema/
-  CodeGen run — by the time CodeGen sees a `Bring` statement it's a no-op
-  marker, and every brought-in job is just an ordinary top-level `JobDecl`
-  in the flattened `Program` (Fly's job namespace is already flat/
-  unqualified, so no new call syntax was needed). Only project-local
-  resolution (§3.6 point 1: next to the bringing file, or its sibling
-  `src/`) is implemented; bundled-stdlib and `flylink.sleep` dump-package
-  resolution (points 2–3) are open items already flagged by §21, with an
-  `FLY_STDLIB_DIR` environment variable as a documented stand-in for a
-  real bundled stdlib. A module file brought in via `bring` may only
-  contain job declarations (and its own `bring`s) at the top level — Fly
-  doesn't define "run a module's top-level statements at import time"
-  semantics yet, so this is enforced as a clear compile error rather than
-  guessed at. Diamond/repeated `bring`s (including cycles) are resolved
-  correctly without duplicate-declaring or infinite-looping (canonical-
-  path-keyed visited set); a genuine job-name collision between two
-  different brought files (or between a module and the entry file) is a
-  compile error, since Fly 0.1's job namespace has no per-module
-  qualification to disambiguate with. Verified against a diamond-
-  dependency example (`examples/modules_demo/`: `main.fly` brings
-  `geometry` directly *and* `shapes`, which itself brings `geometry`) —
-  leak-free under `valgrind --leak-check=full`.
+Fly takes the approachable style of high-level scripting languages and combines it with a native compiler and first-party project tooling.
 
+### Fly aims to give you
 
+* A readable, high-level syntax
+* Dynamic typing
+* Native executable compilation
+* A built-in project toolchain
+* Dependency management
+* A package ecosystem
+* Project manifests
+* Formatting
+* Testing
+* Cleaning build artifacts
+* Running projects
+* Toolchain updates
+* Module support
+* A native REPL
+* Cross-platform compiler architecture
+* A distinctive, simple vocabulary
 
-```sh
-# Debian/Ubuntu, e.g.:
-sudo apt-get install llvm-20-dev clang cmake ninja-build libzstd-dev
+---
 
-cmake -B build -G Ninja -DLLVM_DIR=$(llvm-config-20 --cmakedir)
-cmake --build build
+# A Fly program
+
+```fly
+name = take("What is your name? ")
+
+if name == "Rick" {
+    show("Welcome back, {name}!")
+}
+orif name == "admin" {
+    show("Administrator access granted.")
+}
+ifnot {
+    show("Hello, {name}!")
+}
 ```
+
+Functions are deliberately simple:
+
+```fly
+job add(a, b) {
+    give a + b
+}
+
+result = add(10, 20)
+
+show("Result: {result}")
+```
+
+And because Fly is dynamically typed:
+
+```fly
+value = 42
+value = "Hello"
+value = Yes
+```
+
+No type declaration ceremony is required.
+
+---
+
+# Native compilation
+
+Fly is a **compiled language**.
+
+A `.fly` source file is transformed through the Fly compiler into a native executable.
+
+```text
+.fly
+  ↓
+Lexer
+  ↓
+Parser
+  ↓
+Semantic analysis
+  ↓
+LLVM IR generation
+  ↓
+LLVM optimization
+  ↓
+Native backend
+  ↓
+Linker
+  ↓
+Executable
+```
+
+Fly does not require a language-level interpreter or virtual machine for normal execution.
+
+The compiler is implemented in C++ and uses LLVM for native code generation.
+
+The runtime is implemented separately as `libflyrt` with a stable C ABI.
+
+---
+
+# The Fly toolchain
+
+Fly is more than a compiler.
+
+The `fly` command is intended to be the **entry point for the entire development workflow**.
+
+```text
+fly
+├── compile
+├── build
+├── run
+├── test
+├── deps
+├── dump
+├── init
+├── format
+├── clean
+├── up
+└── uninstall
+```
+
+## Compile
+
+Compile one Fly source file:
+
+```cmd
+fly -compile src/main.fly
+```
+
+An icon can be supplied for Windows native executables:
+
+```cmd
+fly -compile src/main.fly -icon logo.ico
+```
+
+---
+
+## Build
+
+Build a Fly project from its `flylink.sleep` manifest:
+
+```cmd
+fly -build
+```
+
+The project manifest describes the source file, output and dependencies.
+
+Example:
+
+```sleep
+project
+  name "hello"
+  version "0.1.0"
+  source "src/main.fly"
+  output "bin/hello"
+  icon "assets/hello.ico"
+  deps coll ["http"]
+```
+
+---
 
 ## Run
 
-```sh
-./build/fly-cc examples/fizzbuzz.fly -o fizzbuzz
-./fizzbuzz
+Build and run the project:
 
-./build/fly-cc examples/collections.fly -o collections
-./collections
+```cmd
+fly -run
 ```
 
-Useful flags: `--dump-ast` (print the parsed AST and exit-code-0 continue),
-`--dump-ir` (print the generated LLVM IR before linking).
+Fly can determine when a rebuild is necessary from project source and module timestamps.
 
-The `fly` toolchain launcher dispatches the project-level commands
-(docs/architecture.md §7.2) and the compiler (`fly-cc`) and REPL
-(`fly-repl`) that ship beside it:
-
-```sh
-# one-off compile / format
-./build/fly -compile hello.fly -o hello
-./build/fly -format src/main.fly
-
-# scaffold, build, run, test a project (around a flylink.sleep manifest)
-./build/fly -init my_project
-cd my_project
-../build/fly -deps --offline   # install flylink.sleep 'deps' from the local mirror
-../build/fly -build
-../build/fly -run              # rebuilds when sources are newer, then runs
-../build/fly -test             # builds+runs tests/*.fly (or a test "..." line)
-../build/fly -clean            # removes build artifacts (never source/deps)
-
-# Dump package lifecycle
-../build/fly -dump install "sleep"     # HTTPS from Dump, mirror fallback
-../build/fly -dump list
-../build/fly -dump remove "sleep"
-../build/fly -dump update --offline
-```
-
-Run `fly -help` for the full surface. `-format` is the official deterministic,
-semantics-preserving formatter: it only moves whitespace, preserves `$`/`$$`
-comments and text literals verbatim, refuses syntactically invalid input, is
-idempotent, and verifies its output lexes to the same token stream before
-writing.
+---
 
 ## Test
 
-```sh
-cd build && ctest --output-on-failure
+Run the project's tests:
+
+```cmd
+fly -test
 ```
 
-For an ARC correctness check beyond the functional e2e tests, run any
-example under valgrind, e.g.:
+---
 
-```sh
-valgrind --leak-check=full ./arc_stress
+## Format
+
+Format Fly source using the official formatter:
+
+```cmd
+fly -format
 ```
 
-## Layout
+The goal is to avoid every project inventing its own formatting conventions.
 
+---
+
+## Clean
+
+Remove generated build artifacts:
+
+```cmd
+fly -clean
 ```
-fly-cc/
-├── CMakeLists.txt
-├── include/flycc/        public headers (token, lexer, ast, parser, sema, codegen, driver)
+
+---
+
+## Initialize a project
+
+Create a new Fly project:
+
+```cmd
+fly -init myapp
+```
+
+A project contains a `flylink.sleep` manifest and a source tree.
+
+Typical layout:
+
+```text
+myapp/
+├── flylink.sleep
 ├── src/
-│   ├── lexer/  parser/  ast/  sema/  codegen/  driver/
-│   └── main.cpp
-├── runtime/               libflyrt (plain C, see docs/architecture.md §4)
-│                          value/show/arith/error (milestone 1-3) +
-│                          text/coll/board/strbuild (milestone 4) +
-│                          cast/iter (milestone 6)
-├── examples/              fizzbuzz.fly, mixed_arith.fly, interpolation.fly,
-│                          collections.fly, arc_stress.fly, error_handling.fly,
-│                          casting.fly, for_loops.fly, modules_demo/
-└── tests/                 CTest wiring + e2e golden output
+│   └── main.fly
+├── module/
+└── bin/
 ```
 
-See `docs/architecture.md` (the architecture doc from the design
-conversation — copy it into `docs/` in this repo) for the full design,
-including the parts not built yet: atomic refcounting once concurrency
-lands, the mutation-guard concurrency-safety mechanism, the layered
-concurrency model, and `bring`'s bundled-stdlib/package resolution.
+---
 
+# One ecosystem
+
+Fly is designed around an unusually integrated development experience.
+
+Instead of requiring a collection of unrelated tools:
+
+```text
+language
+compiler
+build system
+package manager
+dependency file
+formatter
+test runner
+project generator
+runtime
+```
+
+Fly brings these pieces together under the same toolchain.
+
+The goal is simple:
+
+> **You should be able to install Fly and have everything you need to start building software.**
+
+That does not mean Fly will prevent developers from using external tools.
+
+It means they shouldn't be mandatory merely to get a normal project built and managed.
+
+---
+
+# Packages and dependencies
+
+Fly projects use the `deps` field in `flylink.sleep`.
+
+```sleep
+project
+  name "webapp"
+  version "0.1.0"
+  source "src/main.fly"
+  output "bin/webapp"
+  deps coll ["http", "sleep"]
+```
+
+Dependencies are managed through Fly's package ecosystem.
+
+Install a package:
+
+```cmd
+fly -dump install http
+```
+
+List installed packages:
+
+```cmd
+fly -dump list
+```
+
+Remove a package:
+
+```cmd
+fly -dump remove http
+```
+
+Update packages:
+
+```cmd
+fly -dump update
+```
+
+Offline dependency operations can be performed with:
+
+```cmd
+fly -dump install http --offline
+```
+
+The package system is designed around the Fly ecosystem rather than requiring a separate package manager.
+
+---
+
+# Dump
+
+**Dump** is Fly's package index and distribution mechanism.
+
+Public packages are published through the Fly Dump ecosystem.
+
+This allows Fly projects to use normal module imports:
+
+```fly
+bring http
+bring sleep
+```
+
+while the project toolchain handles obtaining those dependencies.
+
+The project manifest records installed dependencies so builds remain reproducible and understandable.
+
+---
+
+# `flylink.sleep`
+
+Fly uses **SLEEP** for its project manifest format.
+
+Example:
+
+```sleep
+project
+  name "myapp"
+  version "0.1.0"
+  source "src/main.fly"
+  output "bin/myapp"
+  icon "assets/myapp.ico"
+  deps coll ["http"]
+```
+
+SLEEP is:
+
+**Simple Lightweight Extensible Expression Protocol**
+
+It is an indentation-based data/configuration format designed to be easier to write and read than heavily punctuated configuration formats.
+
+Fly uses SLEEP because project configuration should be readable too.
+
+---
+
+# Project icons
+
+Fly projects can specify an executable icon:
+
+```sleep
+project
+  name "myapp"
+  version "0.1.0"
+  source "src/main.fly"
+  output "bin/myapp"
+  icon "assets/myapp.ico"
+  deps coll []
+```
+
+When building a Windows executable, the configured icon can be embedded into the resulting PE executable.
+
+For one-off compilation:
+
+```cmd
+fly -compile src/main.fly -icon myapp.ico
+```
+
+A project icon is intended to flow through the toolchain automatically:
+
+```text
+flylink.sleep
+      ↓
+project icon
+      ↓
+fly -build
+      ↓
+fly-cc
+      ↓
+native executable
+      ↓
+embedded Windows icon
+```
+
+---
+
+# Fly language
+
+## Dynamic typing
+
+Fly is dynamically typed.
+
+```fly
+name = "Rick"
+age = 18
+pi = 3.14
+ready = Yes
+```
+
+Variables do not normally require explicit type declarations.
+
+---
+
+# Values and types
+
+Fly 0.1 defines these core types:
+
+| Type    | Description          | Example            |
+| ------- | -------------------- | ------------------ |
+| `tex`   | Text                 | `"Hello"`          |
+| `num`   | Integer number       | `42`               |
+| `dec`   | Decimal number       | `3.14`             |
+| `yn`    | Boolean              | `Yes`              |
+| `coll`  | Collection           | `[1, 2, 3]`        |
+| `board` | Key/value collection | `{"name": "Rick"}` |
+| `emp`   | Empty value          | `EMP`              |
+
+Types describe Fly values but normally do not appear in variable declarations.
+
+---
+
+# Variables
+
+Variables are mutable by default.
+
+```fly
+a = 10
+a = 20
+```
+
+Fly is dynamically typed, so the same variable can hold different types:
+
+```fly
+a = 10
+a = "Hello"
+a = Yes
+```
+
+---
+
+# Immutable variables
+
+Use `hard` for an immutable variable:
+
+```fly
+hard name = "Rick"
+```
+
+After initialization:
+
+```fly
+hard age = 18
+
+age = 19
+```
+
+The reassignment is an error.
+
+`hard` applies to all Fly value types.
+
+---
+
+# Comments
+
+Single-line comments begin with `$`.
+
+```fly
+$ This is a comment
+
+name = "Rick" $ Inline comment
+```
+
+Multiline comments use `$$`:
+
+```fly
+$$
+This is a multiline comment.
+
+It can span multiple lines.
+$$
+```
+
+---
+
+# Booleans
+
+Fly uses:
+
+```fly
+Yes
+No
+```
+
+Example:
+
+```fly
+ready = Yes
+running = No
+```
+
+---
+
+# Empty values
+
+Fly uses:
+
+```fly
+EMP
+```
+
+for an empty or absent value.
+
+```fly
+value = EMP
+```
+
+Operations that cannot produce a meaningful value may return `EMP`.
+
+For example:
+
+```fly
+position = seek(items, "Nobody")
+
+if position == EMP {
+    show("Not found.")
+}
+```
+
+---
+
+# Operators
+
+## Arithmetic
+
+```text
++
+-
+*
+/
+%
+```
+
+Example:
+
+```fly
+a = 10 + 5
+b = 20 * 4
+```
+
+## Comparison
+
+```text
+==
+!=
+<
+>
+<=
+>=
+```
+
+## Logical
+
+```text
+and
+or
+not
+```
+
+Example:
+
+```fly
+ready = Yes and running == No
+```
+
+---
+
+# Text
+
+Text values use double quotes:
+
+```fly
+name = "Rick"
+message = "Hello!"
+```
+
+---
+
+# String interpolation
+
+Fly supports expression interpolation directly inside text:
+
+```fly
+age = 17
+
+show("Next year you will be {age + 1}")
+```
+
+Expressions may be arbitrary Fly expressions:
+
+```fly
+job add(a, b) {
+    give a + b
+}
+
+show("Result: {add(10, 5)}")
+```
+
+Direct values also work:
+
+```fly
+show("Value: {age}")
+```
+
+Expressions are evaluated when the text value is created.
+
+---
+
+# Escaped braces
+
+A literal `{` is written as:
+
+```text
+{{
+```
+
+A literal `}` is written as:
+
+```text
+}}
+```
+
+Example:
+
+```fly
+show("Use {{Name}} as an example.")
+```
+
+produces:
+
+```text
+Use {Name} as an example.
+```
+
+---
+
+# Collections
+
+Collections are ordered sequences.
+
+```fly
+items = [10, "Hello", Yes, 3.14]
+```
+
+Collections can contain mixed types.
+
+Indexing starts at zero:
+
+```fly
+items = ["A", "B", "C"]
+
+show(items[0])
+```
+
+Output:
+
+```text
+A
+```
+
+---
+
+# Indexing
+
+Collections and text support square-bracket indexing:
+
+```fly
+items[0]
+name[1]
+```
+
+Text indexing produces a single text element.
+
+---
+
+# Slicing
+
+Collections and text support slicing:
+
+```fly
+items[1:4]
+name[0:3]
+```
+
+The starting index is inclusive.
+
+The ending index is exclusive.
+
+Example:
+
+```fly
+name = "RICK"
+
+show(name[1:4])
+```
+
+Output:
+
+```text
+ICK
+```
+
+Omitted boundaries are supported:
+
+```fly
+name[:3]
+name[2:]
+name[:]
+```
+
+---
+
+# Collection and text operations
+
+Fly uses readable command-oriented names for common operations.
+
+## `attach`
+
+Append a value:
+
+```fly
+attach(items, "New")
+```
+
+## `place`
+
+Insert at an index:
+
+```fly
+place(items, 1, "Inserted")
+```
+
+## `erase`
+
+Remove an element:
+
+```fly
+erase(items, 2)
+```
+
+## `count`
+
+Get the number of elements:
+
+```fly
+count(items)
+```
+
+Objects that expose a length API also support:
+
+```fly
+items.length()
+name.length()
+```
+
+## `seek`
+
+Search for a value or substring:
+
+```fly
+seek(items, "Alex")
+seek("Hello World", "World")
+```
+
+For collections, `seek` returns the matching index.
+
+For text, `seek` returns the matching substring position.
+
+When no match exists:
+
+```text
+EMP
+```
+
+## `has`
+
+Check for a value or substring:
+
+```fly
+has(items, "Alex")
+has("Hello World", "World")
+```
+
+The result is:
+
+```fly
+Yes
+No
+```
+
+## `bind`
+
+Join collection values into text:
+
+```fly
+items = ["A", "B", "C"]
+
+result = bind(items, ", ")
+```
+
+Result:
+
+```text
+A, B, C
+```
+
+## `sever`
+
+Split text into a collection:
+
+```fly
+sever("A,B,C", ",")
+```
+
+Result:
+
+```fly
+["A", "B", "C"]
+```
+
+## `cut`
+
+Remove surrounding whitespace:
+
+```fly
+cut(text)
+```
+
+## `raise`
+
+Convert text to uppercase:
+
+```fly
+raise(text)
+```
+
+## `lower`
+
+Convert text to lowercase:
+
+```fly
+lower(text)
+```
+
+---
+
+# Boards
+
+A `board` stores key/value pairs.
+
+Example:
+
+```fly
+people = {
+    "Rick": 18
+    "Bob": 25
+}
+```
+
+Boards may use non-text keys.
+
+The exact board literal grammar and access semantics are part of the Fly grammar/toolchain specification.
+
+---
+
+# Functions
+
+Functions are declared with `job`:
+
+```fly
+job add(a, b) {
+    give a + b
+}
+```
+
+Call them normally:
+
+```fly
+result = add(10, 20)
+```
+
+Functions do not require parameter or return-type declarations.
+
+---
+
+# Returning values
+
+Use `give`:
+
+```fly
+job square(x) {
+    give x * x
+}
+```
+
+A function that finishes without giving a value produces:
+
+```fly
+EMP
+```
+
+---
+
+# Input and output
+
+Read input with `take`:
+
+```fly
+name = take("What is your name: ")
+```
+
+Display values with `show`:
+
+```fly
+show("Hello")
+show(name)
+show(10 + 5)
+```
+
+---
+
+# Conditions
+
+Fly uses:
+
+```text
+if
+orif
+ifnot
+```
+
+Example:
+
+```fly
+name = take("What is your name: ")
+
+if name == "admin" {
+    show("Welcome back!")
+}
+orif name == "RICK" {
+    show("Hi rick!")
+}
+ifnot {
+    show("Hello, {name}!")
+}
+```
+
+---
+
+# Loops
+
+Fly provides `while` and `for`.
+
+## `while`
+
+```fly
+while condition {
+    ...
+}
+```
+
+## `for`
+
+```fly
+for item in items {
+    show(item)
+}
+```
+
+Iteration semantics depend on the iterable value.
+
+---
+
+# Error handling
+
+Fly provides structured error handling through `do` and `grabe`.
+
+```fly
+do {
+    ...
+}
+grabe (err) {
+    ...
+}
+```
+
+Example:
+
+```fly
+do {
+    value = num("hello")
+}
+grabe (err) {
+    show("The conversion failed.")
+}
+```
+
+An error that is not handled by a surrounding `grabe` block propagates outward.
+
+An unhandled error terminates the current operation/program and reports the error.
+
+---
+
+# Type casting
+
+Fly is dynamically typed, but values can be explicitly converted between compatible types.
+
+The target type acts as the conversion function:
+
+```fly
+age = num("18")
+price = dec("19.99")
+text = tex(123)
+```
+
+More examples:
+
+```fly
+a = num(10.8)
+b = dec(10)
+c = tex(10)
+```
+
+Invalid conversions produce runtime errors.
+
+```fly
+do {
+    number = num("hello")
+}
+grabe (err) {
+    show("Invalid number.")
+}
+```
+
+Casting does not mutate another variable's original value.
+
+---
+
+# Modules
+
+Fly supports modules using `bring`.
+
+```fly
+bring math
+bring filesystem
+```
+
+Imported modules provide functionality to the program.
+
+Public modules can also be installed through Fly's package ecosystem.
+
+Example:
+
+```fly
+bring http
+
+response = http.get_tls("https://example.com")
+```
+
+---
+
+# Built-in modules
+
+Fly's toolchain defines compiler/runtime-backed modules including:
+
+```text
+net
+filesystem
+process
+environment
+system
+path
+```
+
+These expose standard platform functionality through Fly's API.
+
+Examples include operations conceptually such as:
+
+```fly
+path.join(...)
+filesystem.read(...)
+process.run(...)
+environment.get(...)
+system.os(...)
+net.connect_tls(...)
+```
+
+The compiler recognizes the built-in API surface and routes these operations to the Fly runtime.
+
+---
+
+# Public modules
+
+Public ecosystem modules are installed into the project's `module/` directory.
+
+For example:
+
+```text
+module/
+└── http.fly
+```
+
+Then a Fly program can use:
+
+```fly
+bring http
+```
+
+and call its public API.
+
+This keeps the language itself small while allowing the ecosystem to grow independently.
+
+---
+
+# HTTP and networking
+
+Fly's standard ecosystem supports native networking facilities.
+
+The toolchain/runtime provides:
+
+* TCP sockets
+* HTTPS/TLS
+* DNS
+* Platform networking APIs
+* HTTP functionality through public modules
+
+Example:
+
+```fly
+bring http
+
+response = http.get_tls("https://google.com")
+
+show(response["status"])
+```
+
+Native TLS support uses real TLS rather than silently falling back to plain HTTP.
+
+Certificate and hostname verification are part of the secure HTTPS path.
+
+---
+
+# Memory management
+
+Fly uses **automatic reference counting (ARC)**.
+
+Fly does not use a tracing garbage collector as its language runtime memory model.
+
+The current runtime uses tagged `FlyValue` values with reference counting.
+
+Reference counts are atomic where required by concurrent execution.
+
+Cycles are a known limitation of the current model.
+
+The goal is predictable native memory management while keeping the language high-level.
+
+---
+
+# `FlyValue`
+
+The runtime represents Fly values with a tagged value structure.
+
+Conceptually:
+
+```text
+FlyValue
+├── NUM
+├── DEC
+├── YN
+├── EMP
+├── TEX
+├── COLL
+└── BOARD
+```
+
+The runtime uses a compact tagged representation and heap-backed structures for complex values such as text, collections and boards.
+
+---
+
+# Runtime architecture
+
+The Fly runtime is separated from the compiler.
+
+```text
+fly-cc
+   │
+   └── native program
+          │
+          └── libflyrt
+```
+
+`libflyrt` is implemented in C and exposes a stable C ABI to generated code.
+
+This separation allows the compiler and runtime to evolve independently.
+
+---
+
+# Compiler architecture
+
+The current compiler architecture is:
+
+```text
+                  ┌───────────────┐
+                  │   .fly file   │
+                  └───────┬───────┘
+                          │
+                       Lexer
+                          │
+                       Parser
+                          │
+                        Sema
+                          │
+                       IRGen
+                          │
+                    LLVM modules
+                          │
+                    LLVM linking
+                          │
+                     LLVM opt
+                          │
+                    LLVM backend
+                          │
+                      Linker
+                          │
+                   Native binary
+```
+
+Each source file can be represented as an LLVM module.
+
+Modules can be linked at the LLVM IR level before optimization, allowing cross-file optimization opportunities such as inlining.
+
+---
+
+# The Fly executables
+
+The Fly toolchain is divided into clear roles.
+
+## `fly.exe`
+
+The main developer-facing tool.
+
+It handles project and toolchain commands such as:
+
+```text
+fly
+fly -compile
+fly -build
+fly -run
+fly -test
+fly -deps
+fly -dump
+fly -init
+fly -format
+fly -clean
+fly -up
+fly -uninstall
+```
+
+With no command-line flags, Fly launches the REPL.
+
+---
+
+## `fly-cc.exe`
+
+The native Fly compiler.
+
+It handles:
+
+```text
+lexer
+parser
+semantic analysis
+IR generation
+LLVM
+linking
+native executable generation
+```
+
+---
+
+## `fly-repl.exe`
+
+The interactive Fly REPL.
+
+The REPL uses the real Fly compiler rather than maintaining a completely separate interpreter implementation.
+
+Conceptually:
+
+```text
+REPL input
+    ↓
+Fly compiler
+    ↓
+native executable
+    ↓
+execute
+```
+
+This keeps REPL behavior close to actual compiled-program behavior.
+
+---
+
+# The REPL
+
+Example:
+
+```text
+>>> 1 + 1
+2
+
+>>> a = 10
+
+>>> a
+10
+
+>>> "hello"
+hello
+
+>>> 10 * 4
+40
+
+>>> Yes
+Yes
+```
+
+Explicit output calls are not duplicated:
+
+```text
+>>> show(1 + 1)
+2
+```
+
+Multiline expressions can continue across input lines:
+
+```text
+>>> (1 +
+... 1)
+2
+```
+
+The REPL preserves successful session state while failed turns do not corrupt previously established state.
+
+---
+
+# Toolchain updates
+
+Fly is designed to update itself through the same toolchain.
+
+The intended command is:
+
+```cmd
+fly -up
+```
+
+The updater can query the latest Fly GitHub Release, determine its release tag, download the appropriate release artifact, verify it and safely replace the current installation.
+
+This allows users to maintain the language and toolchain without manually reinstalling every release.
+
+---
+
+# Windows installation
+
+The Windows distribution is intended to provide a normal installer experience:
+
+```text
+fly-setup.exe
+      ↓
+Fly installer
+      ↓
+Fly installed
+      ↓
+PATH configured
+      ↓
+fly
+```
+
+The Windows installation includes the native Fly executables and required runtime components.
+
+The installer can embed and use the Fly project icon as part of the Windows application experience.
+
+---
+
+# Native Windows executables
+
+Fly can produce native Windows executables.
+
+The Windows distribution includes the compiler, runtime components and required runtime DLLs.
+
+Executable icons can be embedded into the PE executable rather than merely copied beside it.
+
+This means a built Fly application can appear as a normal Windows application in Explorer and shortcuts.
+
+---
+
+# Portability
+
+Fly's compiler architecture is intended to be portable.
+
+The high-level architecture separates:
+
+```text
+language frontend
+       ↓
+LLVM IR
+       ↓
+platform backend/linker
+       ↓
+native executable
+```
+
+Platform-specific runtime functionality is isolated where necessary.
+
+Windows and POSIX platforms may use different underlying system APIs while exposing the same Fly-level concepts.
+
+---
+
+# Project structure
+
+A typical Fly project looks like:
+
+```text
+myapp/
+├── flylink.sleep
+├── src/
+│   ├── main.fly
+│   └── utils.fly
+├── module/
+│   └── http.fly
+├── assets/
+│   └── myapp.ico
+└── bin/
+    └── myapp.exe
+```
+
+A minimal manifest:
+
+```sleep
+project
+  name "myapp"
+  version "0.1.0"
+  source "src/main.fly"
+  output "bin/myapp"
+  deps coll []
+```
+
+With an icon:
+
+```sleep
+project
+  name "myapp"
+  version "0.1.0"
+  source "src/main.fly"
+  output "bin/myapp"
+  icon "assets/myapp.ico"
+  deps coll []
+```
+
+---
+
+# Complete development workflow
+
+The intended Fly workflow is:
+
+```text
+Install Fly
+    ↓
+fly -init myapp
+    ↓
+Write .fly files
+    ↓
+fly -dump install ...
+    ↓
+fly -build
+    ↓
+fly -run
+    ↓
+fly -test
+    ↓
+fly -format
+    ↓
+Ship native executable
+```
+
+No separate project generator, package manager, formatter or build-system configuration is required for the basic workflow.
+
+---
+
+# Language philosophy
+
+Fly does not attempt to reproduce another programming language.
+
+Its design priorities are:
+
+1. **Readability**
+2. **Simplicity**
+3. **Consistency**
+4. **Expressiveness**
+5. **Practical native compilation**
+6. **A distinctive Fly vocabulary**
+
+The goal is not to make every feature configurable.
+
+The goal is to make the common path pleasant.
+
+---
+
+# Python-inspired, not Python-compatible
+
+Fly is intentionally comfortable for programmers familiar with high-level languages.
+
+However, Fly is **not Python syntax with a few renamed keywords**.
+
+Fly has its own:
+
+* Syntax
+* Types
+* Runtime
+* Compiler
+* Module system
+* Error handling model
+* Package manager
+* Project manifest
+* Build system
+* CLI
+* Ecosystem
+
+The point is to provide a similar level of accessibility while building a different language from the ground up.
+
+---
+
+# Fly 0.1 language specification
+
+This section defines the current Fly 0.1 language design.
+
+## File extension
+
+Fly source files use:
+
+```text
+.fly
+```
+
+---
+
+## Comments
+
+Single-line:
+
+```fly
+$ comment
+```
+
+Multiline:
+
+```fly
+$$
+comment
+comment
+$$
+```
+
+---
+
+## Core values
+
+```text
+tex
+num
+dec
+yn
+coll
+board
+emp
+```
+
+Boolean literals:
+
+```fly
+Yes
+No
+```
+
+Empty literal:
+
+```fly
+EMP
+```
+
+---
+
+## Variables
+
+```fly
+a = 10
+```
+
+Variables are mutable unless declared with `hard`:
+
+```fly
+hard a = 10
+```
+
+---
+
+## Operators
+
+Arithmetic:
+
+```text
++
+-
+*
+/
+%
+```
+
+Comparison:
+
+```text
+==
+!=
+<
+>
+<=
+>=
+```
+
+Logical:
+
+```text
+and
+or
+not
+```
+
+---
+
+## Strings
+
+```fly
+message = "Hello"
+```
+
+Interpolation:
+
+```fly
+show("Hello {name}")
+```
+
+Escaped braces:
+
+```fly
+show("Use {{name}} literally.")
+```
+
+---
+
+## Collections
+
+```fly
+items = [1, 2, 3]
+```
+
+Index:
+
+```fly
+items[0]
+```
+
+Slice:
+
+```fly
+items[1:3]
+items[:3]
+items[2:]
+items[:]
+```
+
+---
+
+## Boards
+
+Boards represent key/value data:
+
+```fly
+person = {
+    "name": "Rick"
+    "age": 18
+}
+```
+
+The board grammar defines the exact literal and access syntax.
+
+---
+
+## Functions
+
+```fly
+job add(a, b) {
+    give a + b
+}
+```
+
+A function call:
+
+```fly
+result = add(10, 20)
+```
+
+No explicit parameter or return type is required.
+
+---
+
+## Input
+
+```fly
+name = take("Name: ")
+```
+
+---
+
+## Output
+
+```fly
+show("Hello")
+```
+
+---
+
+## Conditions
+
+```fly
+if condition {
+    ...
+}
+orif other_condition {
+    ...
+}
+ifnot {
+    ...
+}
+```
+
+---
+
+## Loops
+
+```fly
+while condition {
+    ...
+}
+```
+
+and:
+
+```fly
+for item in items {
+    show(item)
+}
+```
+
+---
+
+## Errors
+
+```fly
+do {
+    ...
+}
+grabe (err) {
+    ...
+}
+```
+
+Errors can propagate to an enclosing error handler.
+
+---
+
+## Casting
+
+```fly
+num("42")
+dec("3.14")
+tex(123)
+```
+
+Invalid conversions raise runtime errors.
+
+---
+
+## Modules
+
+```fly
+bring math
+```
+
+Public modules can be installed into the project's module tree.
+
+---
+
+# Reserved keywords
+
+Fly 0.1 reserves:
+
+```text
+if
+orif
+ifnot
+
+while
+for
+
+job
+give
+
+take
+show
+bring
+
+do
+grabe
+
+hard
+
+attach
+place
+erase
+count
+seek
+has
+bind
+sever
+cut
+raise
+lower
+
+Yes
+No
+EMP
+```
+
+Compatibility aliases or legacy vocabulary may exist in development versions, but new code should use the current Fly 0.1 names.
+
+---
+
+# Fly 0.1 status
+
+**Fly 0.1 — Language design and toolchain milestone**
+
+Current design/implementation areas include:
+
+* Dynamic typing
+* Mutable variables
+* `hard` immutable variables
+* `tex`
+* `num`
+* `dec`
+* `yn`
+* `coll`
+* `board`
+* `emp`
+* Arithmetic
+* Comparison
+* Logical operators
+* Indexing
+* Slicing
+* String interpolation
+* Functions
+* Conditions
+* `while`
+* `for`
+* Input/output
+* Collection operations
+* Error handling
+* Type casting
+* Modules
+* Native compilation
+* LLVM backend
+* Native runtime
+* Project manifests
+* Dependency management
+* Package management
+* Formatting
+* Testing
+* Project initialization
+* Build/run/clean workflows
+* Native Windows executables
+* Windows installation tooling
+* Executable icons
+* Native REPL
+* Toolchain update infrastructure
+
+Some advanced APIs and platform capabilities continue to evolve as Fly approaches a stable release.
+
+---
+
+# Example: a complete small program
+
+```fly
+job greet(name) {
+    if name == EMP {
+        give "Nobody"
+    }
+
+    give name
+}
+
+name = take("What is your name? ")
+
+message = greet(name)
+
+show("Hello, {message}!")
+```
+
+---
+
+# Example: collections
+
+```fly
+items = ["Fly", "SLEEP", "Dump"]
+
+attach(items, "LLVM")
+
+for item in items {
+    show(item)
+}
+
+show("Items: {count(items)}")
+```
+
+---
+
+# Example: error handling
+
+```fly
+input = take("Enter a number: ")
+
+do {
+    number = num(input)
+    show("You entered {number}.")
+}
+grabe (err) {
+    show("That wasn't a valid number.")
+}
+```
+
+---
+
+# Example: module usage
+
+```fly
+bring http
+
+response = http.get_tls("https://example.com")
+
+show(response["status"])
+```
+
+---
+
+# Example: project
+
+`flylink.sleep`:
+
+```sleep
+project
+  name "webapp"
+  version "0.1.0"
+  source "src/main.fly"
+  output "bin/webapp"
+  icon "assets/webapp.ico"
+  deps coll ["http"]
+```
+
+`src/main.fly`:
+
+```fly
+bring http
+
+response = http.get_tls("https://example.com")
+
+show("HTTP status: {response["status"]}")
+```
+
+Build:
+
+```cmd
+fly -build
+```
+
+Run:
+
+```cmd
+fly -run
+```
+
+---
+
+# Design principle: batteries included
+
+Fly's philosophy is not that every feature must live in the language itself.
+
+Instead:
+
+> **The language should stay small while the ecosystem stays complete.**
+
+That means:
+
+* language syntax stays readable
+* standard capabilities live in modules/runtime APIs
+* third-party functionality lives in packages
+* the toolchain provides a consistent way to obtain and use both
+
+The result is intended to feel like one ecosystem rather than a pile of unrelated utilities.
+
+---
+
+# Roadmap
+
+Fly 0.1 establishes the core language and toolchain.
+
+Future work can expand:
+
+* Standard libraries
+* More public modules
+* More platform targets
+* Better diagnostics
+* Faster builds
+* Better optimization
+* More packaging capabilities
+* Broader testing infrastructure
+* Stable module APIs
+* More complete developer tooling
+* A mature package ecosystem
+
+The exact roadmap may change as implementation progresses.
+
+---
+
+# Contributing
+
+Fly is a language and toolchain project.
+
+Contributions can involve:
+
+* The language frontend
+* Compiler/code generation
+* LLVM integration
+* Runtime
+* Standard modules
+* Package infrastructure
+* Toolchain commands
+* Documentation
+* Tests
+* Developer experience
+
+When modifying Fly, preserve the distinction between:
+
+```text
+language
+compiler
+runtime
+toolchain
+ecosystem
+```
+
+A feature should live in the layer where it naturally belongs.
+
+---
+
+# License
+
+Add the project's chosen license here.
+
+---
+
+# Fly
+
+**Write it simply. Compile it natively. Build everything with one toolchain.**
+
+```text
+                    Fly
+                     │
+       ┌─────────────┼─────────────┐
+       │             │             │
+    Language      Compiler      Runtime
+       │             │             │
+       └─────────────┼─────────────┘
+                     │
+                  Toolchain
+                     │
+        ┌────────────┼────────────┐
+        │            │            │
+      Build        Packages      Run
+        │            │            │
+        └────────────┼────────────┘
+                     │
+                  Ecosystem
+                     │
+                  Software
+```
+
+**One language. One toolchain. One ecosystem.**
