@@ -2104,9 +2104,45 @@ A feature should live in the layer where it naturally belongs.
 
 ---
 
-# License
+# Licensing
 
-Add the project's chosen license here.
+Fly uses a **dual-licensing model**.
+
+## Free for noncommercial use
+
+The Fly source code is available under the **PolyForm Noncommercial License 1.0.0**.
+
+You may use, study, modify, compile, and distribute Fly for permitted noncommercial purposes, including personal projects, hobby projects, research, experimentation, education, and other uses covered by the license.
+
+The complete license is provided in [`LICENSE`](LICENSE).
+
+## Commercial use
+
+Commercial use of Fly is available under a separate **Fly Commercial License**.
+
+A commercial license is intended for organizations and individuals who want to use Fly for commercial software, commercial products, internal business operations, or other uses that are not permitted by the free noncommercial license.
+
+The commercial license may provide additional rights such as:
+
+* Commercial use
+* Proprietary modifications
+* Distribution of commercial software built with or based on Fly
+* Embedding Fly into commercial products
+* Commercial redistribution
+* Additional support and business terms
+
+See [`LICENSE-COMMERCIAL.md`](LICENSE-COMMERCIAL.md) for the commercial licensing terms.
+
+### Why dual licensing?
+
+Fly is source-available because we want people to be able to learn from it, experiment with it, improve it, and build noncommercial projects without paying for a license.
+
+At the same time, commercial licensing allows Fly to support a sustainable ecosystem and continued development of the compiler, runtime, standard libraries, package infrastructure, and developer tooling.
+
+**You do not need a commercial license for permitted noncommercial use.**
+
+**Commercial use requires a Fly Commercial License unless another license or written permission from the copyright holder explicitly grants the required rights.**
+
 
 ---
 
