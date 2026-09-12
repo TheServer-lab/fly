@@ -1,0 +1,11 @@
+$ Milestone 6, §3.6: a module that itself `bring`s another module,
+$ exercising the transitive/diamond case (main.fly also brings `geometry`
+$ directly -- driver.cpp's ModuleMerger must not double-declare it).
+
+bring geometry
+
+job describeRectangle(width, height) {
+    a = area(width, height)
+    p = perimeter(width, height)
+    give "{width}x{height} rectangle: area={a} perimeter={p}"
+}

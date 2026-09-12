@@ -1,0 +1,11 @@
+$ Milestone 6, §3.6: a `bring`-able module. Per driver.cpp's ModuleMerger,
+$ a module file may only contain job declarations (and its own `bring`s)
+$ at the top level -- no loose executable statements.
+
+job area(width, height) {
+    give width * height
+}
+
+job perimeter(width, height) {
+    give (width + height) * 2
+}

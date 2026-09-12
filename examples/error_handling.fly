@@ -1,0 +1,59 @@
+$ Milestone 5 (docs/architecture.md §3.5): `do`/`grabe`, backed by real
+$ LLVM invoke/landingpad + the Itanium C++ exception ABI (see
+$ runtime/eh.cpp and codegen.cpp's genDoGrabe). Exercises: a runtime error
+$ thrown directly inside a `do` block, one thrown several frames down
+$ inside a called `job`, nested do/grabe (an error re-thrown from inside a
+$ `grabe` block reaching the OUTER `grabe`), and a `do` block that
+$ completes with no error at all (grabe_body must not run).
+
+job safeDivide(a, b) {
+    give a / b
+}
+
+$ 1. Error thrown directly in the do block's own statements.
+do {
+    x = 10 / 0
+    show(x)
+} grabe (err) {
+    show("caught #1:")
+    show(err)
+}
+
+$ 2. Error thrown from inside a job called from the do block -- proves
+$ unwinding correctly crosses an ordinary (non-invoke) call frame.
+do {
+    y = safeDivide(20, 0)
+    show(y)
+} grabe (err) {
+    show("caught #2:")
+    show(err)
+}
+
+$ 3. Nested do/grabe: the inner grabe catches its own error, then itself
+$ throws (by calling something that fails), which the OUTER grabe catches.
+do {
+    do {
+        z = 1 % 0
+        show(z)
+    } grabe (innerErr) {
+        show("caught #3 (inner):")
+        show(innerErr)
+        w = safeDivide(1, 0) $ throws again -- should reach the outer grabe
+        show(w)
+    }
+} grabe (outerErr) {
+    show("caught #3 (outer):")
+    show(outerErr)
+}
+
+$ 4. A `do` block with no error at all: grabe_body must NOT run, and
+$ execution continues normally afterward.
+do {
+    show("no error in this do block")
+    r = safeDivide(10, 2)
+    show(r)
+} grabe (err) {
+    show("should never print")
+}
+
+show("all do/grabe cases completed")

@@ -1,0 +1,11 @@
+$ Milestone 6, §3.6: `bring`. Brings `geometry` directly AND `shapes`
+$ (which itself brings `geometry`) -- a diamond dependency that
+$ driver.cpp's ModuleMerger must resolve without redeclaring `geometry`'s
+$ jobs twice or erroring on a false "duplicate job" collision.
+
+bring geometry
+bring shapes
+
+show(area(4, 5))
+show(perimeter(4, 5))
+show(describeRectangle(3, 7))

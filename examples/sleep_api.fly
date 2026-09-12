@@ -1,0 +1,100 @@
+$ SLEEP/NET follow-up milestone: exercises the SLEEP v1.0 library
+$ (dump-mirror/sleep.fly) end to end -- parse_text/parse/write/format/
+$ to_json/from_json, nested objects, coll literals, yes/no/empty,
+$ num/dec, @references, SLEEP's own `bring "x.sleep"` imports, and
+$ malformed-input error handling via do/grabe. Self-contained: builds its
+$ own fixture .sleep files at runtime (via filesystem.write) into a
+$ throwaway scratch dir, same "self-contained, safe to re-run" convention
+$ examples/filesystem_api.fly already uses -- it also sidesteps Fly 0.1
+$ source literals having no backslash-escapes at all (see
+$ runtime/text.c's fly_rt_char_from_code comment): a real .sleep FILE can
+$ contain a `"` character with no trouble; a Fly SOURCE literal cannot.
+bring sleep
+bring filesystem
+
+nl = rt_char_from_code(10)
+q = rt_char_from_code(34)
+
+workdir = "fly_sleep_api_demo"
+if filesystem.exists(workdir) {
+    filesystem.remove("{workdir}/database.sleep")
+    filesystem.remove("{workdir}/config.sleep")
+    filesystem.remove("{workdir}/roundtrip.sleep")
+    filesystem.remove(workdir)
+}
+filesystem.mkdir(workdir)
+
+$ ---- nested objects, coll, yn/empty, num/dec, references -----------------
+
+configText = "person{nl}  name {q}Alex{q}{nl}  age 29{nl}  active yes{nl}  bio empty{nl}  tags coll [{q}dev{q} {q}sleep{q} {q}coffee{q}]{nl}company{nl}  ceo {q}Alex{q}{nl}  founder @person.name{nl}  rating 4.5{nl}"
+filesystem.write("{workdir}/config.sleep", configText)
+
+config = sleep.parse("{workdir}/config.sleep")
+show(config["person"]["name"])
+show(config["person"]["age"])
+show(config["person"]["active"])
+show(config["person"]["bio"])
+show(config["person"]["tags"])
+show(config["company"]["founder"])
+show(config["company"]["rating"])
+
+$ ---- SLEEP's OWN `bring "x.sleep"` import mechanism -----------------------
+
+dbText = "db{nl}  host {q}localhost{q}{nl}  port 5432{nl}"
+filesystem.write("{workdir}/database.sleep", dbText)
+appText = "bring {q}database.sleep{q}{nl}app{nl}  name {q}myapp{q}{nl}"
+filesystem.write("{workdir}/app.sleep", appText)
+
+merged = sleep.parse("{workdir}/app.sleep")
+show(merged["db"]["host"])
+show(merged["db"]["port"])
+show(merged["app"]["name"])
+
+$ ---- format()/write() round-trip -------------------------------------------
+
+sleep.write("{workdir}/roundtrip.sleep", config)
+reparsed = sleep.parse("{workdir}/roundtrip.sleep")
+show(reparsed["person"]["name"] == config["person"]["name"])
+show(reparsed["company"]["rating"] == config["company"]["rating"])
+
+$ ---- to_json()/from_json() round-trip --------------------------------------
+
+j = sleep.to_json(config)
+back = sleep.from_json(j)
+show(back["person"]["name"])
+show(back["person"]["tags"])
+show(back["person"]["bio"])
+
+$ ---- malformed input is a catchable error, not a crash --------------------
+
+do {
+    sleep.parse_text("name Alex Smith")
+} grabe (err) {
+    show("caught1")
+}
+
+do {
+    sleep.parse_text("x @nowhere.thing")
+} grabe (err) {
+    show("caught2")
+}
+
+do {
+    sleep.parse_text("tags coll [1 2")
+} grabe (err) {
+    show("caught3")
+}
+
+badjson = "{q}a{q}: }}"
+do {
+    sleep.from_json(badjson)
+} grabe (err) {
+    show("caught4")
+}
+
+$ ---- cleanup ----------------------------------------------------------------
+filesystem.remove("{workdir}/database.sleep")
+filesystem.remove("{workdir}/app.sleep")
+filesystem.remove("{workdir}/config.sleep")
+filesystem.remove("{workdir}/roundtrip.sleep")
+filesystem.remove(workdir)

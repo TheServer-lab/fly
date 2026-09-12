@@ -1,0 +1,40 @@
+$ Milestone 7, §5.2/§7/§10: `filesystem.*`. Uses a throwaway working
+$ directory (relative to wherever this binary is run from) so the test
+$ is self-contained and safe to re-run. Runtime failures are ordinary
+$ catchable Fly errors (do/grabe).
+
+bring filesystem
+
+workdir = "fly_filesystem_api_demo"
+
+if filesystem.exists(workdir) {
+    filesystem.remove("{workdir}/greeting.txt")
+    filesystem.remove(workdir)
+}
+
+filesystem.mkdir(workdir)
+show(filesystem.exists(workdir))
+show(filesystem.isdir(workdir))
+show(filesystem.isfile(workdir))
+
+filepath = "{workdir}/greeting.txt"
+filesystem.write(filepath, "hello")
+show(filesystem.read(filepath))
+
+filesystem.append(filepath, ", world")
+show(filesystem.read(filepath))
+
+show(filesystem.isfile(filepath))
+show(filesystem.list(workdir))
+
+do {
+    filesystem.read("{workdir}/does-not-exist.txt")
+} grabe (err) {
+    show("caught a filesystem error")
+}
+show("still running after grabe")
+
+filesystem.remove(filepath)
+show(filesystem.exists(filepath))
+filesystem.remove(workdir)
+show(filesystem.exists(workdir))

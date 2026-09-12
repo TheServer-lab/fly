@@ -1,0 +1,43 @@
+$ Milestone 6, spec §23: num()/dec()/tex() casts. Covers every accepted
+$ source tag for each cast (num/dec/yn/tex, per runtime/cast.c's design
+$ note), including truncation-toward-zero for dec->num and tex parsing
+$ with surrounding whitespace tolerated.
+
+show(num(3.9))
+show(num(-3.9))
+show(num(Yes))
+show(num(No))
+show(num("42"))
+show(num("  -7  "))
+
+show(dec(5))
+show(dec(Yes))
+show(dec("3.5"))
+
+show(tex(5))
+show(tex(3.25))
+show(tex(Yes))
+show(tex([1, 2, 3]))
+
+$ Round-trips and a small computation to prove the cast result is a real,
+$ usable value of the target type, not just printable.
+x = num("10") + num("32")
+show(x)
+y = dec("1.5") * 4
+show(y)
+
+$ Casts are ordinary runtime errors, catchable with do/grabe just like any
+$ other Fly error (milestone 5). Note: per genDoGrabe's documented MVP
+$ limitation (codegen.cpp, milestone 5 -- "does NOT run ARC cleanup for
+$ ... locals that are live ... at the moment of unwind"), the tex literal
+$ argument below is a live temporary at the instant num() throws, so this
+$ one case leaks that one small allocation under valgrind -- a known,
+$ already-documented gap in the unwind path, not a new bug in casting
+$ itself (arithmetic/comparison errors thrown with only num/dec operands,
+$ as in examples/error_handling.fly, don't hit it, since there's no heap
+$ temp live at the throw point in those cases).
+do {
+    show(num("not a number"))
+} grabe (e) {
+    show(e)
+}

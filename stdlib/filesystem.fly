@@ -1,0 +1,28 @@
+$ Milestone 7, §5.2/§10: the `filesystem` standard library module.
+$
+$ `filesystem.*` is a set of compiler-known dotted-call builtins (see
+$ codegen.cpp's genCall `builtins` table and runtime/filesystem.c) bound
+$ straight to their libflyrt symbol -- same mechanism as `path.*`, and
+$ deliberately NOT a `bring`-able job wrapper: Fly's job namespace is flat
+$ (docs/architecture.md §3.6), so giving filesystem/process/environment/
+$ system each their own same-named wrapper jobs (e.g. `exists`, `get`)
+$ would collide the moment more than one was brought into the same file.
+$ This file exists purely so `bring filesystem` resolves (per §3.6's
+$ module resolution) and documents the API at the point of use.
+$
+$ Every operation below throws a catchable Fly error (via
+$ do { ... } grabe (err) { ... }) on failure.
+$
+$ Available after `bring filesystem`:
+$
+$   filesystem.exists(path)
+$   filesystem.isfile(path)
+$   filesystem.isdir(path)
+$   filesystem.read(path)
+$   filesystem.write(path, text)
+$   filesystem.append(path, text)
+$   filesystem.mkdir(path)
+$   filesystem.remove(path)
+$   filesystem.list(path)
+$   filesystem.cwd()
+$   filesystem.chdir(path)

@@ -1,0 +1,324 @@
+$ ============================================================================
+$ HTTP v1.0 -- a public Fly HTTP/1.1 client (bring http)
+$ ============================================================================
+$
+$ Built on top of `bring net` (runtime/net.c's plain TCP + TLS primitives).
+$ This is real Fly source, resolved through the public-module mechanism
+$ (driver.cpp's resolveModule, §3.6 point 3), not a compiler builtin.
+$ `bring http` pulls in exactly this file's jobs, callable both by their
+$ flat names (from inside this file) and, at any call site that wrote
+$ `bring http`, under the qualified `http.<name>` spelling.
+$
+$ Public API:
+$   http.get(url)     -> board { status: num, headers: board, body: tex }
+$                        over plain TCP (http:// URLs)
+$   http.get_tls(url) -> same, over TLS (https:// URLs) -- certificate
+$                        verification against the system trust store, plus
+$                        the additive FLY_TLS_CA_FILE env hook if set (see
+$                        runtime/net.c -- there is no way to disable
+$                        verification from Fly source).
+$
+$ Limitations (v1.0, documented rather than silently wrong):
+$   - GET only (no POST/PUT/DELETE/...; no request body support at all).
+$   - Connection: close, one request per connection -- every GET opens a
+$     fresh connection, sends `Connection: close`, reads the response until
+$     the server closes (EOF-delimited body), and closes. There is no
+$     keep-alive / connection reuse between calls.
+$   - The body is ALWAYS treated as EOF-delimited: Content-Length, if
+$     present, is parsed into the headers board but NOT used to frame the
+$     body, and `Transfer-Encoding: chunked` responses are NOT decoded --
+$     a chunked response's chunk-size/terminator lines would come back as
+$     literal body bytes. (Both assumptions hold for the close-delimited
+$     responses this module itself asks for; a server that ignores
+$     Connection: close and streams a chunked body will not parse cleanly.)
+$   - No redirect following: the caller gets the raw response, 3xx status
+$     and Location header included.
+$   - No interim/1xx handling: the FIRST status line is treated as the
+$     final status, so a `100 Continue` before the real response would be
+$     misread as the status.
+$   - Header names are lowercased; a header sent twice (e.g. multiple
+$     Set-Cookie) keeps only the last value.
+$   - URL hosts are parsed as plain `host` or `host:port` only -- bracketed
+$     IPv6 literals like `http://[::1]:8080/` are NOT supported.
+
+bring net
+
+native job rt_char_from_code(code)
+native job rt_throwv(v)
+
+$ ---- byte constants (Fly source literals can't spell these) -----------------
+
+job http_nl() { give rt_char_from_code(10) }
+job http_cr() { give rt_char_from_code(13) }
+job http_colon() { give rt_char_from_code(58) }
+job http_space() { give rt_char_from_code(32) }
+
+$ ---- URL parsing ------------------------------------------------------------
+$
+$ Parses a URL like "https://example.com:8443/path?query" into a board:
+$   { scheme: "https", host: "example.com", port: 8443, path: "/path?query" }
+
+job http_parse_url(url) {
+  scheme = "http"
+  port = 80
+  work = url
+  n = count(url)
+
+  $ Strip scheme prefix
+  if n >= 7 {
+    if url[0 : 7] == "http://" {
+      scheme = "http"
+      work = url[7 : n]
+      n = count(work)
+    }
+  }
+  if n >= 8 {
+    if url[0 : 8] == "https://" {
+      scheme = "https"
+      work = url[8 : n]
+      n = count(work)
+      port = 443
+    }
+  }
+
+  $ Split off path (first / after host)
+  hostPort = work
+  path = "/"
+  slashIdx = 0
+  foundSlash = No
+  i = 0
+  while i < n and foundSlash == No {
+    if work[i] == "/" {
+      slashIdx = i
+      foundSlash = Yes
+    } ifnot {
+      i = i + 1
+    }
+  }
+  if foundSlash == Yes {
+    hostPort = work[0 : slashIdx]
+    path = work[slashIdx : n]
+  }
+
+  $ Split host:port
+  host = hostPort
+  colonIdx = 0
+  foundColon = No
+  j = 0
+  hpCount = count(hostPort)
+  while j < hpCount and foundColon == No {
+    if hostPort[j] == http_colon() {
+      colonIdx = j
+      foundColon = Yes
+    } ifnot {
+      j = j + 1
+    }
+  }
+  if foundColon == Yes {
+    host = hostPort[0 : colonIdx]
+    portStr = hostPort[colonIdx + 1 : hpCount]
+    do {
+      port = num(portStr)
+    } grabe (err) {
+      rt_throwv("http: invalid port in URL: {portStr}")
+    }
+  }
+
+  give {"scheme": scheme, "host": host, "port": port, "path": path}
+}
+
+$ ---- CRLF and request building ----------------------------------------------
+$
+$ defaultPort is the scheme's default (80 for http, 443 for https) and is
+$ used to decide whether the Host header must carry an explicit port
+$ (RFC 9112 §7.2 / RFC 7230 §5.4: the port is REQUIRED in Host when it
+$ differs from the default, and MUST be omitted when it equals it).
+
+job http_crlf() {
+  give "{http_cr()}{http_nl()}"
+}
+
+job http_build_request(host, port, defaultPort, path, method) {
+  crlf = http_crlf()
+  hostValue = host
+  if port != defaultPort {
+    hostValue = "{host}:{port}"
+  }
+  give "{method} {path} HTTP/1.1{crlf}Host: {hostValue}{crlf}Connection: close{crlf}{crlf}"
+}
+
+$ ---- response parsing -------------------------------------------------------
+$
+$ Reads the full response from a connection, then parses it into
+$ { status: num, headers: board, body: tex }.
+
+job http_read_response(conn) {
+  chunks = []
+  going = Yes
+  while going == Yes {
+    chunk = net.receive(conn, 65536)
+    if chunk == "" {
+      going = No
+    } ifnot {
+      attach(chunks, chunk)
+    }
+  }
+  give bind(chunks, "")
+}
+
+job http_parse_status_line(line) {
+  $ "HTTP/1.1 200 OK" -> extract the status code
+  n = count(line)
+  $ Find first space
+  sp1 = 0
+  found = No
+  i = 0
+  while i < n and found == No {
+    if line[i] == http_space() {
+      sp1 = i
+      found = Yes
+    } ifnot {
+      i = i + 1
+    }
+  }
+  if found == No {
+    rt_throwv("http: malformed status line: {line}")
+  }
+  $ Find second space (or end of line)
+  sp2 = n
+  found2 = No
+  j = sp1 + 1
+  while j < n and found2 == No {
+    if line[j] == http_space() {
+      sp2 = j
+      found2 = Yes
+    } ifnot {
+      j = j + 1
+    }
+  }
+  statusStr = line[sp1 + 1 : sp2]
+  do {
+    give num(statusStr)
+  } grabe (err) {
+    rt_throwv("http: invalid status code: {statusStr}")
+  }
+}
+
+job http_parse_headers(headerSection) {
+  headers = {}
+  lines = sever(headerSection, http_nl())
+  for line in lines {
+    stripped = cut(line)
+    if count(stripped) > 0 {
+      $ Find colon separating header name from value
+      n = count(stripped)
+      colonIdx = 0
+      foundColon = No
+      k = 0
+      while k < n and foundColon == No {
+        if stripped[k] == http_colon() {
+          colonIdx = k
+          foundColon = Yes
+        } ifnot {
+          k = k + 1
+        }
+      }
+      if foundColon == Yes {
+        name = lower(cut(stripped[0 : colonIdx]))
+        val = cut(stripped[colonIdx + 1 : n])
+        place(headers, name, val)
+      }
+    }
+  }
+  give headers
+}
+
+job http_parse_response(raw) {
+  crlf = http_crlf()
+  $ Split headers from body on "\r\n\r\n"
+  doubleCrlf = "{crlf}{crlf}"
+  sepIdx = 0
+  found = No
+  rawN = count(raw)
+  dlLen = count(doubleCrlf)
+  i = 0
+  while i <= rawN - dlLen and found == No {
+    if raw[i : i + dlLen] == doubleCrlf {
+      sepIdx = i
+      found = Yes
+    } ifnot {
+      i = i + 1
+    }
+  }
+  if found == No {
+    rt_throwv("http: could not find end of headers in response")
+  }
+  headerSection = raw[0 : sepIdx]
+  body = raw[sepIdx + dlLen : rawN]
+
+  $ Parse status line (first line of headers)
+  headerLines = sever(headerSection, http_nl())
+  if count(headerLines) == 0 {
+    rt_throwv("http: empty header section in response")
+  }
+  firstLine = headerLines[0]
+  $ Strip trailing CR if present
+  fln = count(firstLine)
+  if fln > 0 {
+    if firstLine[fln - 1] == http_cr() {
+      firstLine = firstLine[0 : fln - 1]
+    }
+  }
+  status = http_parse_status_line(firstLine)
+
+  $ Parse remaining header lines
+  remainingHeaders = ""
+  if count(headerLines) > 1 {
+    parts = []
+    idx = 1
+    while idx < count(headerLines) {
+      attach(parts, headerLines[idx])
+      idx = idx + 1
+    }
+    remainingHeaders = bind(parts, http_nl())
+  }
+  headers = http_parse_headers(remainingHeaders)
+
+  give {"status": status, "headers": headers, "body": body}
+}
+
+$ ---- public API: GET --------------------------------------------------------
+
+job get(url) {
+  parsed = http_parse_url(url)
+  host = parsed["host"]
+  port = parsed["port"]
+  path = parsed["path"]
+  req = http_build_request(host, port, 80, path, "GET")
+  do {
+    conn = net.connect(host, port)
+    net.send(conn, req)
+    raw = http_read_response(conn)
+    net.close(conn)
+    give http_parse_response(raw)
+  } grabe (err) {
+    rt_throwv("http.get: {err}")
+  }
+}
+
+job get_tls(url) {
+  parsed = http_parse_url(url)
+  host = parsed["host"]
+  port = parsed["port"]
+  path = parsed["path"]
+  req = http_build_request(host, port, 443, path, "GET")
+  do {
+    conn = net.connect_tls(host, port)
+    net.send(conn, req)
+    raw = http_read_response(conn)
+    net.close(conn)
+    give http_parse_response(raw)
+  } grabe (err) {
+    rt_throwv("http.get_tls: {err}")
+  }
+}

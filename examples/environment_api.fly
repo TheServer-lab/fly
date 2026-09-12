@@ -1,0 +1,15 @@
+$ Milestone 7, §5.4/§7/§9: `environment.*`. `has` is already a reserved
+$ Fly keyword (§15.6), so the exists-check is spelled `exists`, not
+$ `has`. An unset variable returns EMP from `get` rather than throwing.
+
+bring environment
+
+show(environment.exists("FLY_TEST_DEFINITELY_UNSET_XYZ"))
+show(environment.get("FLY_TEST_DEFINITELY_UNSET_XYZ"))
+
+environment.set("FLY_TEST_VAR", "hello from fly")
+show(environment.exists("FLY_TEST_VAR"))
+show(environment.get("FLY_TEST_VAR"))
+
+environment.set("FLY_TEST_VAR", "overwritten")
+show(environment.get("FLY_TEST_VAR"))

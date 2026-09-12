@@ -1,0 +1,24 @@
+$ docs/architecture.md §7 roadmap step 3: "get fizzbuzz.fly running end-to-end
+$ through LLVM to a native binary" using only scalars (num/yn/tex-literal),
+$ arithmetic, if/orif/ifnot, while, job/give, and show.
+
+job fizz(n) {
+    if n % 15 == 0 {
+        show("FizzBuzz")
+    }
+    orif n % 3 == 0 {
+        show("Fizz")
+    }
+    orif n % 5 == 0 {
+        show("Buzz")
+    }
+    ifnot {
+        show(n)
+    }
+}
+
+i = 1
+while i <= 30 {
+    fizz(i)
+    i = i + 1
+}

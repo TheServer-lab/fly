@@ -1,0 +1,24 @@
+$ docs/architecture.md §2.3 ARC: repeatedly builds and discards colls of
+$ interpolated tex values across many job calls and loop iterations, to
+$ exercise retain/release at scope-exit, reassignment, and container-slot
+$ boundaries. Run under valgrind --leak-check=full in CI-adjacent checks;
+$ it should allocate/free in exactly matched pairs with zero leaks.
+
+job build(n) {
+    coll = []
+    i = 0
+    while i < n {
+        attach(coll, "item-{i}")
+        i = i + 1
+    }
+    give bind(coll, ",")
+}
+
+result = EMP
+i = 0
+while i < 2000 {
+    result = build(20)
+    i = i + 1
+}
+show(result)
+show("done")

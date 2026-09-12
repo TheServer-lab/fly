@@ -1,0 +1,14 @@
+$ Milestone 7, §5.4/§9: the `environment` standard library module.
+$
+$ `environment.*` is a set of compiler-known dotted-call builtins (see
+$ codegen.cpp's genCall `builtins` table and runtime/environment.c) --
+$ see filesystem.fly's header comment for why this is a doc-only marker.
+$
+$ `has` is already a reserved Fly keyword (collection operation, §15.6),
+$ so the public API here is `exists(name)`, NOT `has(name)`.
+$
+$ Available after `bring environment`:
+$
+$   environment.get(name)           $ EMP if unset (matches board's "EMP if absent")
+$   environment.exists(name)
+$   environment.set(name, value)

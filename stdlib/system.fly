@@ -1,0 +1,11 @@
+$ Milestone 7, §5.5/§12: the `system` standard library module.
+$
+$ `system.*` is a set of compiler-known dotted-call builtins (see
+$ codegen.cpp's genCall `builtins` table and runtime/system.c) -- see
+$ filesystem.fly's header comment for why this is a doc-only marker.
+$
+$ Available after `bring system`:
+$
+$   system.os()
+$   system.arch()
+$   system.hostname()

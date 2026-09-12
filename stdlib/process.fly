@@ -1,0 +1,19 @@
+$ Milestone 7, §5.1/§11: the `process` standard library module.
+$
+$ `process.*` is a set of compiler-known dotted-call builtins (see
+$ codegen.cpp's genCall `builtins` table and runtime/process.c), same
+$ mechanism as `path.*`/`filesystem.*` -- see filesystem.fly's header
+$ comment for why this is a doc-only marker rather than a job wrapper.
+$
+$ `run` blocks until the child exits and returns its exit code. `spawn`
+$ returns immediately with a pid-like handle that `wait` later blocks on.
+$ Both throw a catchable Fly error if the program can't even be started
+$ (e.g. "no such program").
+$
+$ Available after `bring process`:
+$
+$   process.args()                  $ coll of tex, argv[1..] (program name excluded)
+$   process.run(program, argv)      $ argv: coll of tex; blocks; returns num exit code
+$   process.spawn(program, argv)    $ non-blocking; returns num pid ("child" handle)
+$   process.wait(child)             $ blocks until `child` exits; returns num exit code
+$   process.exit(code)              $ never returns

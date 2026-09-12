@@ -1,0 +1,59 @@
+$ SLEEP/NET milestone: the `net` standard library module.
+$
+$ `net` is a BUILT-IN/runtime-backed module, NOT a public Fly library --
+$ this is the one deliberate architectural split this milestone draws a
+$ hard line on (see the milestone brief §3-§6): SLEEP is real Fly source
+$ (sleep.fly, resolved through the public-module/package mechanism);
+$ `net` is compiler-known dotted-call builtins bound straight to libflyrt
+$ (runtime/net.c), exactly like `filesystem.*`/`path.*` already are (see
+$ codegen.cpp's genCall `builtins` table and runtime/net.c). This file
+$ exists purely so `bring net` resolves (per docs/architecture.md §3.6's
+$ module resolution) and documents the API at the point of use -- same
+$ role stdlib/filesystem.fly already plays, see its header comment.
+$
+$ Every operation below is a BLOCKING plain-TCP-or-TLS primitive and throws
+$ a catchable Fly error (via do { ... } grabe (err) { ... }) on failure.
+$ TLS/HTTPS follow-up milestone: net.connect_tls() gives a REAL TLS
+$ connection (OpenSSL-backed, real certificate + hostname verification --
+$ see runtime/net.c and flyrt.h's §5.6 for the implementation). https://
+$ origins are reachable by using net.connect_tls() instead of
+$ net.connect() and sending the request over it -- see runtime/net.c for
+$ the implementation, and dump/public/http.fly for a ready-made HTTP/1.1
+$ client built on top of this.
+$
+$ Available after `bring net`:
+$
+$   net.resolve(host)          -> tex: first resolved IP address for host
+$   net.connect(host, port)    -> num: a connected plain TCP socket handle
+$   net.connect_tls(host, port)-> num: a connected, certificate-and-hostname-
+$                                  verified TLS connection handle -- looks
+$                                  and works just like a plain connect()
+$                                  handle to send()/receive()/close() below
+$   net.listen(host, port)     -> num: a listening TCP socket handle
+$                                  (host "0.0.0.0" binds every interface)
+$   net.accept(server)         -> num: blocks for the next client connection
+$   net.send(conn, data)       -> num: bytes sent (data is tex, sent as raw bytes; works on a plain or TLS conn)
+$   net.receive(conn, maxlen)  -> tex: up to maxlen bytes ("" means the peer closed the connection; works on a plain or TLS conn)
+$   net.close(conn)            -> EMP: closes a connect/connect_tls/listen/accept handle
+$
+$ Example (HTTPS-ish client, manual request -- see dump/public/http.fly
+$ for a real client that builds/parses this for you):
+$
+$   do {
+$     conn = net.connect_tls("example.com", 443)
+$     net.send(conn, "GET / HTTP/1.1{nl}Host: example.com{nl}Connection: close{nl}{nl}")
+$     reply = net.receive(conn, 65536)
+$     show(reply)
+$     net.close(conn)
+$   } grabe (err) {
+$     show("net error: {err}")
+$   }
+$
+$ Example (plaintext server, one connection then exit):
+$
+$   server = net.listen("0.0.0.0", 9000)
+$   conn = net.accept(server)
+$   msg = net.receive(conn, 1024)
+$   net.send(conn, "echo: {msg}")
+$   net.close(conn)
+$   net.close(server)

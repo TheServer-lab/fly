@@ -1,0 +1,16 @@
+$ Milestone 7, §5.5/§7/§12: `system.*`. os()/arch()/hostname() reflect
+$ the actual machine fly-cc is running on, so this checks structural
+$ properties (non-empty tex, no embedded whitespace) rather than exact
+$ values -- an exact-value test would be non-portable across machines.
+
+bring system
+
+os = system.os()
+arch = system.arch()
+host = system.hostname()
+
+show(count(os) > 0)
+show(count(arch) > 0)
+show(count(host) > 0)
+
+show(has(os, " "))

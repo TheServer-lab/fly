@@ -1,0 +1,38 @@
+$ Milestone 7, §5.1/§7/§11: `process.*`. args() reflects the running
+$ program's own argv[1..]; run() blocks and returns the child's exit
+$ code; spawn()+wait() do the same non-blocking. Uses a real shell with
+$ an explicit `exit N` so the codes are deterministic and don't depend on
+$ any external program (cmd.exe /c on Windows, /bin/sh on POSIX).
+$
+$ Note the Windows /c spellings: cmd re-parses the command line ITSELF
+$ rather than through the C runtime's argv quoting, so a single spaced
+$ argument like "exit 7" gets quote-mangled by cmd's /c handling -- the
+$ exit code is therefore passed as its own separate token.
+
+bring process
+bring system
+
+show(process.args())
+
+os = system.os()
+code = 0
+child = 0
+if os == "windows" {
+    code = process.run("cmd.exe", ["/c", "exit", "0"])
+    show(code)
+
+    code = process.run("cmd.exe", ["/c", "exit", "7"])
+    show(code)
+
+    child = process.spawn("cmd.exe", ["/c", "exit", "3"])
+    show(process.wait(child))
+} ifnot {
+    code = process.run("/bin/sh", ["-c", "exit 0"])
+    show(code)
+
+    code = process.run("/bin/sh", ["-c", "exit 7"])
+    show(code)
+
+    child = process.spawn("/bin/sh", ["-c", "exit 3"])
+    show(process.wait(child))
+}

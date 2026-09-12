@@ -1,0 +1,1148 @@
+$ ============================================================================
+$ SLEEP v1.0 -- a public Fly library (bring sleep)
+$ ============================================================================
+$
+$ SLEEP/NET follow-up milestone. Unlike filesystem/process/environment/
+$ system/net (all built-in/runtime-backed -- see stdlib/net.fly's header
+$ comment), this file is the REAL implementation: every SLEEP.parse(),
+$ .format(), .to_json(), etc. below is ordinary Fly source, resolved
+$ through the public-module mechanism (docs/architecture.md §3.6 point 3 /
+$ driver.cpp's resolveModule), not a compiler builtin. `bring sleep` pulls
+$ in exactly this file's jobs, callable both by their flat names (from
+$ inside this file) and, at any call site that wrote `bring sleep`, under
+$ the qualified `sleep.<name>` spelling (see ast.h's
+$ Program::module_aliases and driver.cpp's ModuleMerger -- a generic
+$ mechanism, not special-cased to this module).
+$
+$ ---- SLEEP v1.0 grammar, as implemented here -------------------------------
+$
+$ A SLEEP document is a sequence of lines. Leading spaces (NOT tabs --
+$ rejected with an error) on a line set that line's indent level; deeper
+$ indent nests inside the nearest preceding shallower line, exactly like
+$ the milestone brief's own example:
+$
+$   person
+$     name Alex
+$     age 29
+$     active yes
+$
+$ parses to the board { person: { name: "Alex", age: 29, active: Yes } }.
+$
+$ Blank lines are ignored anywhere. A line whose first non-space character
+$ is `$` is a whole-line comment and is ignored (matches Fly's own line-
+$ comment marker, per the milestone brief's examples).
+$
+$ A non-blank, non-comment line is `<key> <rest>` (split on the FIRST
+$ space) or just `<key>` alone:
+$
+$   - `<key>` alone (nothing after it) starts a NESTED OBJECT: every
+$     following line with strictly greater indent becomes that object's
+$     contents, exactly as in the `person` example above.
+$   - `<key> coll [item item ...]` is a COLLECTION of scalar values,
+$     space-separated (NOT comma-separated -- this is SLEEP's own
+$     grammar, deliberately different from Fly's own `[a, b]` coll
+$     literal syntax), e.g. `tags coll ["dev" "sleep" "coffee"]`. Items
+$     are scalars only (no nested colls/objects inside a coll literal, v1.0).
+$   - `<key> <value>` is a scalar. A value is:
+$       * a quoted string: `"...like this..."`, allowed internal spaces
+$         and (per sleep_tokenize's escaping) `\"`, `\\`, `\n` escapes
+$         -- these are SLEEP's OWN escapes, parsed at runtime by this
+$         library, and are unrelated to (and not limited by) Fly source's
+$         own lack of string-literal escapes (see runtime/text.c's
+$         header comment on fly_rt_char_from_code for why that distinction
+$         matters to how this file itself is written).
+$       * a bare (unquoted, no-internal-space) word: `yes`/`no` -> yn,
+$         `empty` -> EMP, a numeric-looking token -> num or dec (dec if
+$         it contains a `.`), `@dotted.path` -> a REFERENCE (resolved
+$         against the whole document's root after parsing completes, so
+$         forward references work), anything else -> tex verbatim.
+$
+$ SLEEP's OWN import mechanism (distinct from Fly's `bring sleep` --
+$ see the milestone brief's "two different `bring`s" section): a line
+$
+$   bring "other.sleep"
+$
+$ parses `other.sleep` (resolved relative to the CURRENT SLEEP file's own
+$ directory -- or, for sleep.parse_text() with no file, the current
+$ working directory) as its own SLEEP document and merges its top-level
+$ keys into the importing document at the point the `bring` line appears
+$ (later/overriding definitions for the same key win, same as any other
+$ duplicate key).
+$
+$ References (`@a.b.c`) are resolved in one pass over the FULLY-merged
+$ document (imports included) after parsing, so a reference may point
+$ at a key defined later in the file, in an import, or in the importing
+$ file from inside an imported one.
+$
+$ ---- Limitations (v1.0, documented rather than silently wrong) ------------
+$ - Tabs in indentation are a hard error (spaces only).
+$ - `coll [...]` items are separated by single spaces and must not
+$   themselves be nested colls/objects.
+$ - `bring "....sleep"` imports must appear as a complete line by
+$   themselves (no inline value after the quoted path).
+$ - Reference paths only walk through objects (boards); a path segment
+$   that hits a coll or scalar mid-path is an error.
+$ - sleep.from_json() does not support `\uXXXX` escapes (Fly text is
+$   byte-oriented, not codepoint-oriented -- see runtime/text.c).
+
+bring filesystem
+bring path
+
+native job rt_typename(v)
+native job rt_throwv(v)
+native job rt_char_from_code(code)
+native job rt_char_code(ch)
+
+$ ---- byte constants (Fly source literals can't spell these -- see
+$ ---- runtime/text.c's header comment on fly_rt_char_from_code) -----------
+
+job sleep_quote_char() { give rt_char_from_code(34) }
+job sleep_backslash_char() { give rt_char_from_code(92) }
+job sleep_nl_char() { give rt_char_from_code(10) }
+job sleep_tab_char() { give rt_char_from_code(9) }
+job sleep_cr_char() { give rt_char_from_code(13) }
+job sleep_lbrace_char() { give rt_char_from_code(123) }
+job sleep_rbrace_char() { give rt_char_from_code(125) }
+
+$ ---- errors -----------------------------------------------------------------
+
+job sleep_error(lineno, msg) {
+  rt_throwv("sleep: line {lineno}: {msg}")
+}
+
+$ ---- small text helpers ------------------------------------------------------
+
+job sleep_is_digit(ch) {
+  give has("0123456789", ch)
+}
+
+job sleep_starts_with(text, prefix) {
+  pn = count(prefix)
+  tn = count(text)
+  if tn < pn {
+    give No
+  }
+  give text[0 : pn] == prefix
+}
+
+job sleep_strip_cr(line) {
+  n = count(line)
+  cr = sleep_cr_char()
+  if n > 0 {
+    if line[n - 1] == cr {
+      give line[0 : n - 1]
+    }
+  }
+  give line
+}
+
+$ Leading-space count for indentation; throws on any tab encountered
+$ before the first non-space character.
+job sleep_leading_spaces(line, lineno) {
+  i = 0
+  n = count(line)
+  tab = sleep_tab_char()
+  stop = No
+  while i < n and stop == No {
+    ch = line[i]
+    if ch == " " {
+      i = i + 1
+    } ifnot {
+      if ch == tab {
+        sleep_error(lineno, "tabs are not allowed in indentation -- use spaces")
+      } ifnot {
+        stop = Yes
+      }
+    }
+  }
+  give i
+}
+
+job sleep_looks_numeric(tok) {
+  n = count(tok)
+  if n == 0 {
+    give No
+  }
+  i = 0
+  if tok[0] == "-" {
+    i = 1
+  }
+  if i >= n {
+    give No
+  }
+  sawDigit = No
+  ok = Yes
+  while i < n and ok == Yes {
+    ch = tok[i]
+    if sleep_is_digit(ch) {
+      sawDigit = Yes
+      i = i + 1
+    } ifnot {
+      if ch == "." {
+        i = i + 1
+      } ifnot {
+        ok = No
+      }
+    }
+  }
+  if ok == No {
+    give No
+  }
+  give sawDigit
+}
+
+job sleep_parse_number(tok, lineno) {
+  hasDot = has(tok, ".")
+  result = EMP
+  ok = Yes
+  if hasDot == Yes {
+    do {
+      result = dec(tok)
+    } grabe (err) {
+      ok = No
+    }
+  } ifnot {
+    do {
+      result = num(tok)
+    } grabe (err) {
+      ok = No
+    }
+  }
+  if ok == No {
+    sleep_error(lineno, "invalid number '{tok}'")
+  }
+  give result
+}
+
+$ ---- tokenizer (shared by scalar `rest` and `coll [...]` interiors) --------
+$
+$ Splits `text` on runs of plain spaces, treating a "..."-quoted span
+$ (supporting \" \\ \n escapes) as one token. Returns a coll of small
+$ boards {"text": tex, "quoted": yn} -- the "quoted" flag matters because
+$ a QUOTED token is always taken as literal tex, never re-interpreted as
+$ yes/no/empty/a number/a reference (see sleep_interpret_token).
+
+job sleep_tokenize(text, lineno) {
+  tokens = []
+  i = 0
+  n = count(text)
+  quote = sleep_quote_char()
+  backslash = sleep_backslash_char()
+  nl = sleep_nl_char()
+  while i < n {
+    ch = text[i]
+    if ch == " " {
+      i = i + 1
+    } ifnot {
+      if ch == quote {
+        buf = []
+        i = i + 1
+        closed = No
+        while i < n and closed == No {
+          c2 = text[i]
+          if c2 == backslash {
+            haveNext = No
+            if i + 1 < n {
+              haveNext = Yes
+            }
+            if haveNext == No {
+              sleep_error(lineno, "unterminated escape in quoted text")
+            }
+            nextc = text[i + 1]
+            if nextc == quote {
+              attach(buf, quote)
+            } ifnot {
+              if nextc == backslash {
+                attach(buf, backslash)
+              } ifnot {
+                if nextc == "n" {
+                  attach(buf, nl)
+                } ifnot {
+                  attach(buf, nextc)
+                }
+              }
+            }
+            i = i + 2
+          } ifnot {
+            if c2 == quote {
+              closed = Yes
+              i = i + 1
+            } ifnot {
+              attach(buf, c2)
+              i = i + 1
+            }
+          }
+        }
+        if closed == No {
+          sleep_error(lineno, "unterminated quoted text")
+        }
+        attach(tokens, {"text": bind(buf, ""), "quoted": Yes})
+      } ifnot {
+        buf = []
+        stop = No
+        while i < n and stop == No {
+          c2 = text[i]
+          if c2 == " " {
+            stop = Yes
+          } ifnot {
+            attach(buf, c2)
+            i = i + 1
+          }
+        }
+        attach(tokens, {"text": bind(buf, ""), "quoted": No})
+      }
+    }
+  }
+  give tokens
+}
+
+$ ---- references ---------------------------------------------------------
+
+job sleep_make_ref(raw) {
+  give {"__sleep_ref__": raw[1 : count(raw)]}
+}
+
+job sleep_is_ref(v) {
+  if rt_typename(v) == "board" {
+    if count(v) == 1 {
+      give has(v, "__sleep_ref__")
+    }
+  }
+  give No
+}
+
+job sleep_lookup_path(root, path, lineno) {
+  segs = sever(path, ".")
+  cur = root
+  for seg in segs {
+    if rt_typename(cur) == "board" {
+      if has(cur, seg) {
+        cur = cur[seg]
+      } ifnot {
+        sleep_error(lineno, "unknown reference @{path} (no key '{seg}')")
+      }
+    } ifnot {
+      sleep_error(lineno, "invalid reference @{path}: '{seg}' is not inside an object")
+    }
+  }
+  give cur
+}
+
+job sleep_resolve(v, root, depth) {
+  if depth > 200 {
+    sleep_error(0, "reference is nested too deeply (possible cycle)")
+  }
+  t = rt_typename(v)
+  if t == "board" {
+    if sleep_is_ref(v) {
+      target = sleep_lookup_path(root, v["__sleep_ref__"], 0)
+      give sleep_resolve(target, root, depth + 1)
+    } ifnot {
+      out = {}
+      for k in v {
+        place(out, k, sleep_resolve(v[k], root, depth + 1))
+      }
+      give out
+    }
+  } ifnot {
+    if t == "coll" {
+      out = []
+      for item in v {
+        attach(out, sleep_resolve(item, root, depth + 1))
+      }
+      give out
+    } ifnot {
+      give v
+    }
+  }
+}
+
+$ ---- token -> Fly value --------------------------------------------------
+
+job sleep_interpret_token(tokDesc, lineno) {
+  raw = tokDesc["text"]
+  if tokDesc["quoted"] == Yes {
+    give raw
+  } ifnot {
+    if raw == "yes" {
+      give Yes
+    } ifnot {
+      if raw == "no" {
+        give No
+      } ifnot {
+        if raw == "empty" {
+          give EMP
+        } ifnot {
+          isRef = No
+          if count(raw) > 0 {
+            if raw[0] == "@" {
+              isRef = Yes
+            }
+          }
+          if isRef == Yes {
+            give sleep_make_ref(raw)
+          } ifnot {
+            if sleep_looks_numeric(raw) {
+              give sleep_parse_number(raw, lineno)
+            } ifnot {
+              give raw
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+$ ---- line preprocessing --------------------------------------------------
+$
+$ Splits `text` into logical lines, dropping blank lines and whole-line
+$ `$`-comments, returning a coll of {"indent": num, "content": tex,
+$ "line": num} in source order. `content` has its leading indent AND any
+$ trailing whitespace already stripped.
+
+job sleep_preprocess(text) {
+  rawLines = sever(text, sleep_nl_char())
+  lines = []
+  lineno = 0
+  for raw in rawLines {
+    lineno = lineno + 1
+    line = sleep_strip_cr(raw)
+    trimmed = cut(line)
+    if count(trimmed) > 0 {
+      indent = sleep_leading_spaces(line, lineno)
+      content = line[indent : count(line)]
+      isComment = No
+      if count(content) > 0 {
+        if content[0] == "$" {
+          isComment = Yes
+        }
+      }
+      if isComment == No {
+        content2 = cut(content)
+        attach(lines, {"indent": indent, "content": content2, "line": lineno})
+      }
+    }
+  }
+  give lines
+}
+
+$ ---- recursive-descent block parser --------------------------------------
+
+job sleep_parse_import(importPath, baseDir, lineno) {
+  fullPath = path.join(baseDir, importPath)
+  ok = Yes
+  text = ""
+  do {
+    text = filesystem.read(fullPath)
+  } grabe (err) {
+    ok = No
+  }
+  if ok == No {
+    sleep_error(lineno, "cannot import '{importPath}': could not read {fullPath}")
+  }
+  importDir = path.dirname(fullPath)
+  lines = sleep_preprocess(text)
+  parsed = sleep_parse_block(lines, 0, 0 - 1, importDir)
+  give parsed["tree"]
+}
+
+$ Parses lines[start:] whose indent is > parentIndent as one object's
+$ contents; stops at the first line whose indent is <= parentIndent (or at
+$ EOF). Returns {"tree": board, "next": indexAfterThisBlock}.
+job sleep_parse_block(lines, start, parentIndent, baseDir) {
+  result = {}
+  i = start
+  n = count(lines)
+  going = Yes
+  while i < n and going == Yes {
+    row = lines[i]
+    indent = row["indent"]
+    if indent <= parentIndent {
+      going = No
+    } ifnot {
+      content = row["content"]
+      lineno = row["line"]
+      sp = seek(content, " ")
+      hasRest = Yes
+      key = content
+      rest = ""
+      if sp == EMP {
+        hasRest = No
+      } ifnot {
+        key = content[0 : sp]
+        restRaw = content[sp + 1 : count(content)]
+        rest = cut(restRaw)
+        if count(rest) == 0 {
+          hasRest = No
+        }
+      }
+      if key == "bring" {
+        if hasRest == No {
+          q = sleep_quote_char()
+          sleep_error(lineno, "'bring' requires a quoted path, e.g. bring {q}other.sleep{q}")
+        }
+        toks = sleep_tokenize(rest, lineno)
+        if count(toks) != 1 {
+          sleep_error(lineno, "'bring' takes exactly one quoted path")
+        }
+        td = toks[0]
+        if td["quoted"] == No {
+          q = sleep_quote_char()
+          sleep_error(lineno, "'bring' path must be quoted, e.g. bring {q}other.sleep{q}")
+        }
+        importedTree = sleep_parse_import(td["text"], baseDir, lineno)
+        for k in importedTree {
+          place(result, k, importedTree[k])
+        }
+        i = i + 1
+      } ifnot {
+        if hasRest == No {
+          sub = sleep_parse_block(lines, i + 1, indent, baseDir)
+          place(result, key, sub["tree"])
+          i = sub["next"]
+        } ifnot {
+          isColl = No
+          bracketInner = ""
+          if sleep_starts_with(rest, "coll") {
+            afterColl = cut(rest[4 : count(rest)])
+            if sleep_starts_with(afterColl, "[") {
+              isColl = Yes
+              bracketInner = afterColl
+            }
+          }
+          if isColl == Yes {
+            innerNoOpen = bracketInner[1 : count(bracketInner)]
+            innerLen = count(innerNoOpen)
+            closedOk = No
+            if innerLen > 0 {
+              if innerNoOpen[innerLen - 1] == "]" {
+                closedOk = Yes
+              }
+            }
+            if closedOk == No {
+              sleep_error(lineno, "coll literal is missing its closing ']'")
+            }
+            interior = cut(innerNoOpen[0 : innerLen - 1])
+            toks = sleep_tokenize(interior, lineno)
+            items = []
+            for td in toks {
+              attach(items, sleep_interpret_token(td, lineno))
+            }
+            place(result, key, items)
+            i = i + 1
+          } ifnot {
+            toks = sleep_tokenize(rest, lineno)
+            if count(toks) != 1 {
+              sleep_error(lineno, "value '{rest}' has more than one word -- wrap it in quotes")
+            }
+            place(result, key, sleep_interpret_token(toks[0], lineno))
+            i = i + 1
+          }
+        }
+      }
+    }
+  }
+  give {"tree": result, "next": i}
+}
+
+$ ---- public API: parsing ---------------------------------------------------
+
+job parse_text(text) {
+  lines = sleep_preprocess(text)
+  parsed = sleep_parse_block(lines, 0, 0 - 1, ".")
+  give sleep_resolve(parsed["tree"], parsed["tree"], 0)
+}
+
+job parse(file) {
+  ok = Yes
+  text = ""
+  do {
+    text = filesystem.read(file)
+  } grabe (err) {
+    ok = No
+  }
+  if ok == No {
+    sleep_error(0, "cannot read '{file}'")
+  }
+  dir = path.dirname(file)
+  lines = sleep_preprocess(text)
+  parsed = sleep_parse_block(lines, 0, 0 - 1, dir)
+  give sleep_resolve(parsed["tree"], parsed["tree"], 0)
+}
+
+$ ---- public API: formatting (SLEEP text) -----------------------------------
+
+job sleep_indent_prefix(indent) {
+  parts = []
+  i = 0
+  while i < indent {
+    attach(parts, "  ")
+    i = i + 1
+  }
+  give bind(parts, "")
+}
+
+job sleep_escape_sleep_text(t) {
+  buf = []
+  i = 0
+  n = count(t)
+  quote = sleep_quote_char()
+  backslash = sleep_backslash_char()
+  nl = sleep_nl_char()
+  while i < n {
+    ch = t[i]
+    if ch == quote {
+      attach(buf, backslash)
+      attach(buf, quote)
+    } ifnot {
+      if ch == backslash {
+        attach(buf, backslash)
+        attach(buf, backslash)
+      } ifnot {
+        if ch == nl {
+          attach(buf, backslash)
+          attach(buf, "n")
+        } ifnot {
+          attach(buf, ch)
+        }
+      }
+    }
+    i = i + 1
+  }
+  give bind(buf, "")
+}
+
+job sleep_quote_text(t) {
+  quote = sleep_quote_char()
+  escaped = sleep_escape_sleep_text(t)
+  give "{quote}{escaped}{quote}"
+}
+
+job sleep_text_needs_quoting(t) {
+  if count(t) == 0 {
+    give Yes
+  }
+  if t == "yes" {
+    give Yes
+  }
+  if t == "no" {
+    give Yes
+  }
+  if t == "empty" {
+    give Yes
+  }
+  if has(t, " ") {
+    give Yes
+  }
+  if t[0] == "@" {
+    give Yes
+  }
+  if sleep_looks_numeric(t) {
+    give Yes
+  }
+  give No
+}
+
+job sleep_format_scalar_value(v) {
+  t = rt_typename(v)
+  if t == "tex" {
+    if sleep_text_needs_quoting(v) {
+      give sleep_quote_text(v)
+    } ifnot {
+      give v
+    }
+  } ifnot {
+    if t == "yn" {
+      if v == Yes {
+        give "yes"
+      } ifnot {
+        give "no"
+      }
+    } ifnot {
+      if t == "emp" {
+        give "empty"
+      } ifnot {
+        if t == "num" {
+          give tex(v)
+        } ifnot {
+          if t == "dec" {
+            give tex(v)
+          } ifnot {
+            sleep_error(0, "cannot format a {t} value as a SLEEP scalar")
+          }
+        }
+      }
+    }
+  }
+}
+
+job sleep_format_into(value, indent, lines) {
+  prefix = sleep_indent_prefix(indent)
+  for k in value {
+    child = value[k]
+    ct = rt_typename(child)
+    if ct == "board" {
+      attach(lines, "{prefix}{k}")
+      sleep_format_into(child, indent + 1, lines)
+    } ifnot {
+      if ct == "coll" {
+        parts = []
+        for item in child {
+          it = rt_typename(item)
+          if it == "coll" {
+            sleep_error(0, "sleep.format(): nested colls inside a coll are not supported by SLEEP v1.0")
+          }
+          if it == "board" {
+            sleep_error(0, "sleep.format(): objects inside a coll are not supported by SLEEP v1.0")
+          }
+          attach(parts, sleep_format_scalar_value(item))
+        }
+        inner = bind(parts, " ")
+        attach(lines, "{prefix}{k} coll [{inner}]")
+      } ifnot {
+        valStr = sleep_format_scalar_value(child)
+        attach(lines, "{prefix}{k} {valStr}")
+      }
+    }
+  }
+}
+
+job format(value) {
+  if rt_typename(value) != "board" {
+    sleep_error(0, "sleep.format() expects a board (an object) at the top level")
+  }
+  lines = []
+  sleep_format_into(value, 0, lines)
+  give bind(lines, sleep_nl_char())
+}
+
+job write(file, value) {
+  filesystem.write(file, format(value))
+  give EMP
+}
+
+$ ---- public API: JSON -------------------------------------------------------
+
+job sleep_json_quote(t) {
+  buf = []
+  i = 0
+  n = count(t)
+  quote = sleep_quote_char()
+  backslash = sleep_backslash_char()
+  nl = sleep_nl_char()
+  tab = sleep_tab_char()
+  cr = sleep_cr_char()
+  while i < n {
+    ch = t[i]
+    if ch == quote {
+      attach(buf, backslash)
+      attach(buf, quote)
+    } ifnot {
+      if ch == backslash {
+        attach(buf, backslash)
+        attach(buf, backslash)
+      } ifnot {
+        if ch == nl {
+          attach(buf, backslash)
+          attach(buf, "n")
+        } ifnot {
+          if ch == tab {
+            attach(buf, backslash)
+            attach(buf, "t")
+          } ifnot {
+            if ch == cr {
+              attach(buf, backslash)
+              attach(buf, "r")
+            } ifnot {
+              attach(buf, ch)
+            }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  joined = bind(buf, "")
+  give "{quote}{joined}{quote}"
+}
+
+job sleep_to_json_value(value) {
+  t = rt_typename(value)
+  if t == "board" {
+    give sleep_to_json_object(value)
+  } ifnot {
+    if t == "coll" {
+      give sleep_to_json_array(value)
+    } ifnot {
+      if t == "tex" {
+        give sleep_json_quote(value)
+      } ifnot {
+        if t == "yn" {
+          if value == Yes {
+            give "true"
+          } ifnot {
+            give "false"
+          }
+        } ifnot {
+          if t == "emp" {
+            give "null"
+          } ifnot {
+            give tex(value)
+          }
+        }
+      }
+    }
+  }
+}
+
+job sleep_to_json_object(b) {
+  parts = []
+  for k in b {
+    v = b[k]
+    kq = sleep_json_quote(k)
+    vs = sleep_to_json_value(v)
+    attach(parts, "{kq}:{vs}")
+  }
+  inner = bind(parts, ",")
+  give "{{{inner}}}"
+}
+
+job sleep_to_json_array(c) {
+  parts = []
+  for item in c {
+    attach(parts, sleep_to_json_value(item))
+  }
+  inner = bind(parts, ",")
+  give "[{inner}]"
+}
+
+job to_json(value) {
+  give sleep_to_json_value(value)
+}
+
+$ ---- JSON parsing: a small mutable {"text":.., "pos":..} cursor, passed
+$ ---- around and mutated via place() (boards alias like any other Fly
+$ ---- heap value across a job call -- see docs/architecture.md §2.2).
+
+job sleep_json_error(state, msg) {
+  p = state["pos"]
+  rt_throwv("sleep.from_json: at byte {p}: {msg}")
+}
+
+job sleep_json_peek(state) {
+  t = state["text"]
+  p = state["pos"]
+  if p < count(t) {
+    give t[p]
+  }
+  give ""
+}
+
+job sleep_json_advance_char(state) {
+  p = state["pos"]
+  place(state, "pos", p + 1)
+}
+
+job sleep_json_skip_ws(state) {
+  t = state["text"]
+  p = state["pos"]
+  n = count(t)
+  going = Yes
+  while p < n and going == Yes {
+    ch = t[p]
+    isws = No
+    if ch == " " {
+      isws = Yes
+    }
+    if ch == sleep_tab_char() {
+      isws = Yes
+    }
+    if ch == sleep_nl_char() {
+      isws = Yes
+    }
+    if ch == sleep_cr_char() {
+      isws = Yes
+    }
+    if isws == Yes {
+      p = p + 1
+    } ifnot {
+      going = No
+    }
+  }
+  place(state, "pos", p)
+}
+
+job sleep_json_expect_char(state, ch) {
+  got = sleep_json_peek(state)
+  if got != ch {
+    sleep_json_error(state, "expected '{ch}' but found '{got}'")
+  }
+  sleep_json_advance_char(state)
+}
+
+job sleep_json_starts_literal(state, lit) {
+  t = state["text"]
+  p = state["pos"]
+  ln = count(lit)
+  n = count(t)
+  if p + ln > n {
+    give No
+  }
+  give t[p : p + ln] == lit
+}
+
+job sleep_json_consume_literal(state, lit) {
+  p = state["pos"]
+  place(state, "pos", p + count(lit))
+}
+
+job sleep_json_parse_string(state) {
+  sleep_json_expect_char(state, sleep_quote_char())
+  t = state["text"]
+  n = count(t)
+  quote = sleep_quote_char()
+  backslash = sleep_backslash_char()
+  buf = []
+  closed = No
+  while closed == No {
+    p = state["pos"]
+    if p >= n {
+      sleep_json_error(state, "unterminated string")
+    }
+    c2 = t[p]
+    if c2 == quote {
+      sleep_json_advance_char(state)
+      closed = Yes
+    } ifnot {
+      if c2 == backslash {
+        haveNext = No
+        if p + 1 < n {
+          haveNext = Yes
+        }
+        if haveNext == No {
+          sleep_json_error(state, "unterminated escape")
+        }
+        esc = t[p + 1]
+        if esc == quote {
+          attach(buf, quote)
+        } ifnot {
+          if esc == backslash {
+            attach(buf, backslash)
+          } ifnot {
+            if esc == "/" {
+              attach(buf, "/")
+            } ifnot {
+              if esc == "n" {
+                attach(buf, sleep_nl_char())
+              } ifnot {
+                if esc == "t" {
+                  attach(buf, sleep_tab_char())
+                } ifnot {
+                  if esc == "r" {
+                    attach(buf, sleep_cr_char())
+                  } ifnot {
+                    if esc == "u" {
+                      sleep_json_error(state, "\\u unicode escapes are not supported by sleep.from_json() in this version")
+                    } ifnot {
+                      attach(buf, esc)
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        place(state, "pos", p + 2)
+      } ifnot {
+        attach(buf, c2)
+        place(state, "pos", p + 1)
+      }
+    }
+  }
+  give bind(buf, "")
+}
+
+job sleep_json_parse_number(state) {
+  t = state["text"]
+  n = count(t)
+  startp = state["pos"]
+  p = startp
+  if p < n {
+    if t[p] == "-" {
+      p = p + 1
+    }
+  }
+  sawDigit = No
+  going = Yes
+  while p < n and going == Yes {
+    ch = t[p]
+    if sleep_is_digit(ch) {
+      sawDigit = Yes
+      p = p + 1
+    } ifnot {
+      going = No
+    }
+  }
+  isDec = No
+  if p < n {
+    if t[p] == "." {
+      isDec = Yes
+      p = p + 1
+      going2 = Yes
+      while p < n and going2 == Yes {
+        ch = t[p]
+        if sleep_is_digit(ch) {
+          p = p + 1
+        } ifnot {
+          going2 = No
+        }
+      }
+    }
+  }
+  if p < n {
+    ec = t[p]
+    if ec == "e" or ec == "E" {
+      isDec = Yes
+      p = p + 1
+      if p < n {
+        sgn = t[p]
+        if sgn == "+" or sgn == "-" {
+          p = p + 1
+        }
+      }
+      going3 = Yes
+      while p < n and going3 == Yes {
+        ch = t[p]
+        if sleep_is_digit(ch) {
+          p = p + 1
+        } ifnot {
+          going3 = No
+        }
+      }
+    }
+  }
+  if sawDigit == No {
+    sleep_json_error(state, "invalid number")
+  }
+  tok = t[startp : p]
+  place(state, "pos", p)
+  if isDec == Yes {
+    give dec(tok)
+  } ifnot {
+    give num(tok)
+  }
+}
+
+job sleep_json_parse_array(state) {
+  sleep_json_advance_char(state)
+  result = []
+  sleep_json_skip_ws(state)
+  first = sleep_json_peek(state)
+  if first == "]" {
+    sleep_json_advance_char(state)
+    give result
+  } ifnot {
+    more = Yes
+    while more == Yes {
+      sleep_json_skip_ws(state)
+      val = sleep_json_parse_value(state)
+      attach(result, val)
+      sleep_json_skip_ws(state)
+      c2 = sleep_json_peek(state)
+      if c2 == "," {
+        sleep_json_advance_char(state)
+      } ifnot {
+        if c2 == "]" {
+          sleep_json_advance_char(state)
+          more = No
+        } ifnot {
+          sleep_json_error(state, "expected ',' or ']' in array")
+        }
+      }
+    }
+    give result
+  }
+}
+
+job sleep_json_parse_object(state) {
+  sleep_json_advance_char(state)
+  result = {}
+  sleep_json_skip_ws(state)
+  first = sleep_json_peek(state)
+  rbrace = sleep_rbrace_char()
+  if first == rbrace {
+    sleep_json_advance_char(state)
+    give result
+  } ifnot {
+    more = Yes
+    while more == Yes {
+      sleep_json_skip_ws(state)
+      key = sleep_json_parse_string(state)
+      sleep_json_skip_ws(state)
+      sleep_json_expect_char(state, ":")
+      sleep_json_skip_ws(state)
+      val = sleep_json_parse_value(state)
+      place(result, key, val)
+      sleep_json_skip_ws(state)
+      c2 = sleep_json_peek(state)
+      rbrace = sleep_rbrace_char()
+      if c2 == "," {
+        sleep_json_advance_char(state)
+      } ifnot {
+        if c2 == rbrace {
+          sleep_json_advance_char(state)
+          more = No
+        } ifnot {
+          sleep_json_error(state, "expected ',' or {rbrace} in object")
+        }
+      }
+    }
+    give result
+  }
+}
+
+job sleep_json_parse_value(state) {
+  sleep_json_skip_ws(state)
+  ch = sleep_json_peek(state)
+  lbrace = sleep_lbrace_char()
+  if ch == lbrace {
+    give sleep_json_parse_object(state)
+  } ifnot {
+    if ch == "[" {
+      give sleep_json_parse_array(state)
+    } ifnot {
+      if ch == sleep_quote_char() {
+        give sleep_json_parse_string(state)
+      } ifnot {
+        if sleep_json_starts_literal(state, "true") {
+          sleep_json_consume_literal(state, "true")
+          give Yes
+        } ifnot {
+          if sleep_json_starts_literal(state, "false") {
+            sleep_json_consume_literal(state, "false")
+            give No
+          } ifnot {
+            if sleep_json_starts_literal(state, "null") {
+              sleep_json_consume_literal(state, "null")
+              give EMP
+            } ifnot {
+              give sleep_json_parse_number(state)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+job from_json(text) {
+  state = {"text": text, "pos": 0}
+  val = sleep_json_parse_value(state)
+  sleep_json_skip_ws(state)
+  p = state["pos"]
+  if p < count(text) {
+    sleep_json_error(state, "trailing content after JSON value")
+  }
+  give val
+}

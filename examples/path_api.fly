@@ -1,0 +1,20 @@
+$ Milestone 7, §5.3/§7/§14: `path.*` -- pure string manipulation, no
+$ filesystem access. Deliberately narrow dotted-call syntax (path.join
+$ etc.), NOT general member access -- see docs/architecture.md and
+$ codegen.cpp's genCall.
+
+bring path
+
+show(path.join("src", "main.fly"))
+show(path.join("a", "b", "c"))
+show(path.join("/abs", "rel"))
+show(path.join("first", "/second"))
+
+show(path.basename("src/main.fly"))
+show(path.dirname("src/main.fly"))
+show(path.extension("main.fly"))
+show(path.extension("README"))
+show(path.stem("main.fly"))
+
+sep = path.separator()
+show(count(sep))

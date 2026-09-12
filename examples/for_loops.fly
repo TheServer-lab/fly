@@ -1,0 +1,55 @@
+$ Milestone 6 ("for lowers against the internal FlyIterator protocol",
+$ docs/architecture.md §3.4/§4.1's runtime/iter.c): `for x in <iterable>`
+$ over each of the three iterable tags -- coll (elements), board (keys, per
+$ iter.c's documented design choice), and tex (one-byte substrings) -- plus
+$ an early `give` from inside a `for` body to exercise the iterator's
+$ cleanup-on-early-return path (see codegen.cpp's iterStack_/releaseAllScopes).
+
+$ 1. coll: iterates elements in order.
+nums = [10, 20, 30, 40]
+total = 0
+for n in nums {
+    total = total + n
+}
+show(total)
+
+$ 2. board: iterates keys (insertion order); index back into the board
+$ inside the loop to get each value.
+ages = {"amy": 30, "ben": 25, "cleo": 41}
+for name in ages {
+    show(name)
+    show(ages[name])
+}
+
+$ 3. tex: iterates one-byte substrings.
+for ch in "fly" {
+    show(ch)
+}
+
+$ 4. Nested for loops.
+grid = [[1, 2], [3, 4]]
+for row in grid {
+    for cell in row {
+        show(cell)
+    }
+}
+
+$ 5. Early `give` from inside a `for` loop (inside a job), proving the
+$ iterator is cleaned up correctly on that path too, not just on normal
+$ loop exhaustion.
+job firstAbove(coll, threshold) {
+    for v in coll {
+        if v > threshold {
+            give v
+        }
+    }
+    give -1
+}
+show(firstAbove([1, 4, 9, 16, 25], 10))
+show(firstAbove([1, 2, 3], 10))
+
+$ 6. An empty coll: the loop body must not run at all.
+for x in [] {
+    show("should never print")
+}
+show("done")

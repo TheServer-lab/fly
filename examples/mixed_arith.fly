@@ -1,0 +1,26 @@
+$ Regression coverage for mixed num/dec arithmetic (docs/architecture.md §2.1,
+$ §3.4.1). num and dec share the FlyValue payload slot but are NOT
+$ interchangeable bit patterns: a num's payload is a raw int64, a dec's
+$ payload is a bit-cast double. Mixed-tag arithmetic must convert (round)
+$ the num operand to a double, never bit-reinterpret its raw payload.
+
+x = 3.14
+y = x * 2
+show(y)
+
+show(10 / 3)
+show(10.0 / 3)
+
+show(1 < 2.5)
+show(2.5 < 1)
+
+a = 5
+b = 2.5
+show(a + b)
+show(a - b)
+show(b - a)
+
+job add(p, q) {
+    give p + q
+}
+show(add(2, 3.5))

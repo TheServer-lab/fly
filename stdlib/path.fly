@@ -1,0 +1,19 @@
+$ Milestone 7, §5.3/§7: the `path` standard library module.
+$
+$ Unlike filesystem/process/environment/system, `path.*` is NOT backed by
+$ `native job` declarations -- `path.join`/`path.basename`/etc. are
+$ compiler-known dotted-call builtins (see codegen.cpp's genCall and
+$ runtime/path.c), reachable from any Fly source with no declaration at
+$ all. This file exists purely so `bring path` resolves to something (per
+$ §3.6's module resolution) and to document the available API at the
+$ point of use -- it intentionally declares nothing.
+$
+$ Available after `bring path`:
+$
+$   path.join(a, b, ...)     $ variadic, >= 1 argument
+$   path.basename(p)
+$   path.dirname(p)
+$   path.extension(p)        $ includes the leading '.'; "" tex if none
+$   path.stem(p)             $ basename with any extension removed
+$   path.absolute(p)
+$   path.separator()         $ one-character tex: '/' or '\'

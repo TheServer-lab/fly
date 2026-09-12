@@ -1,0 +1,23 @@
+$ docs/architecture.md §7 roadmap step 4: text interpolation (spec §10),
+$ exercising nested expressions (§10.1), escaped braces (§10.2), and the
+$ interpolation conversion table (§10.3) across every scalar tag plus
+$ coll/board's "standard representation".
+
+name = "Rick"
+age = 17
+
+show("Next year you will be {age + 1}")
+show("Result: {(age + 3) * 2}")
+show("Value: {name}")
+show("Use {{Name}} as an example.")
+
+pi = 3.14
+ready = Yes
+nothing = EMP
+show("dec={pi} yn={ready} emp={nothing}")
+
+items = [1, "two", Yes]
+show("items = {items}")
+
+board = {"a": 1, "b": 2}
+show("board = {board}")
